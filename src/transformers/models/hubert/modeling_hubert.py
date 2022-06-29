@@ -26,6 +26,18 @@ from torch.nn import CrossEntropyLoss
 from transformers.deepspeed import is_deepspeed_zero3_enabled
 
 from ...activations import ACT2FN
+# ==============================================================================
+# ADDED
+from ...adapters.composition import adjust_tensors_for_parallel
+from ...adapters.context import ForwardContext
+from ...adapters.lora import Linear as LoRALinear
+from ...adapters.mixins.hubert import (
+    HubertEncoderLayerAdaptersMixin,
+    HubertModelAdaptersMixin,
+)
+from ...adapters.model_mixin import InvertibleAdaptersMixin, ModelWithHeadsAdaptersMixin
+from ...adapters.prefix_tuning import PrefixTuningShim
+# ==============================================================================
 from ...modeling_outputs import BaseModelOutput, CausalLMOutput, SequenceClassifierOutput
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import torch_int_div
@@ -401,11 +413,13 @@ class HubertAttention(nn.Module):
 
     def __init__(
         self,
+        config: HubertConfig,                       # ADDED
         embed_dim: int,
         num_heads: int,
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
+        location_key: Optional[str] = None,         # ADDED
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -422,8 +436,11 @@ class HubertAttention(nn.Module):
         self.is_decoder = is_decoder
 
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = LoRALinear(embed_dim, embed_dim, "selfattn", config, bias=bias)                           # CHANGED
+        self.q_proj = LoRALinear(embed_dim, embed_dim, "selfattn", config, bias=bias)                           # CHANGED
+
+        self.prefix_tuning = PrefixTuningShim(location_key + "_prefix" if location_key else None, config)       # CHANGED
+
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -480,6 +497,10 @@ class HubertAttention(nn.Module):
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
+
+        # 2. CHANGED
+        key_states, value_states, attention_mask = self.prefix_tuning(key_states, value_states, attention_mask)
+
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
@@ -546,13 +567,13 @@ class HubertFeedForward(nn.Module):
         super().__init__()
         self.intermediate_dropout = nn.Dropout(config.activation_dropout)
 
-        self.intermediate_dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.intermediate_dense = LoRALinear(config.hidden_size, config.intermediate_size, "intermediate", config)  # CHANGED
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
 
-        self.output_dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.output_dense = LoRALinear(config.intermediate_size, config.hidden_size, "output", config)              # CHANGED
         self.output_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, hidden_states):
@@ -566,19 +587,25 @@ class HubertFeedForward(nn.Module):
 
 
 # Copied from transformers.models.wav2vec2.modeling_wav2vec2.Wav2Vec2EncoderLayer with Wav2Vec2->Hubert
-class HubertEncoderLayer(nn.Module):
+class HubertEncoderLayer(HubertEncoderLayerAdaptersMixin, nn.Module):                                               # CHANGED
     def __init__(self, config):
         super().__init__()
+        self.config = config                                                                                        # CHANGED
+
         self.attention = HubertAttention(
+            config,
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
             dropout=config.attention_dropout,
             is_decoder=False,
+            location_key="self",
         )
         self.dropout = nn.Dropout(config.hidden_dropout)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.feed_forward = HubertFeedForward(config)
         self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        self._init_adapter_modules()                                                                                # CHANGED
 
     def forward(self, hidden_states, attention_mask=None, output_attentions=False):
         attn_residual = hidden_states
@@ -586,11 +613,11 @@ class HubertEncoderLayer(nn.Module):
             hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
         )
         hidden_states = self.dropout(hidden_states)
-        hidden_states = attn_residual + hidden_states
+        hidden_states = self.attention_adapters(hidden_states, attn_residual, self.layer_norm)                      # CHANGED
 
-        hidden_states = self.layer_norm(hidden_states)
-        hidden_states = hidden_states + self.feed_forward(hidden_states)
-        hidden_states = self.final_layer_norm(hidden_states)
+        residual = hidden_states                                                                                    # CHANGED
+        hidden_states = self.feed_forward(hidden_states)                                                            # CHANGED
+        hidden_states = self.output_adapters(hidden_states, residual, self.final_layer_norm)                        # CHANGED
 
         outputs = (hidden_states,)
 
@@ -601,19 +628,25 @@ class HubertEncoderLayer(nn.Module):
 
 
 # Copied from transformers.models.wav2vec2.modeling_wav2vec2.Wav2Vec2EncoderLayerStableLayerNorm with Wav2Vec2->Hubert
-class HubertEncoderLayerStableLayerNorm(nn.Module):
+class HubertEncoderLayerStableLayerNorm(HubertEncoderLayerAdaptersMixin, nn.Module):                                # CHANGED
     def __init__(self, config):
         super().__init__()
+        self.config = config
+
         self.attention = HubertAttention(
+            config,
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
             dropout=config.attention_dropout,
             is_decoder=False,
+            location_key="self",
         )
         self.dropout = nn.Dropout(config.hidden_dropout)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.feed_forward = HubertFeedForward(config)
         self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        self._init_adapter_modules()
 
     def forward(self, hidden_states, attention_mask=None, output_attentions=False):
         attn_residual = hidden_states
@@ -700,6 +733,7 @@ class HubertEncoder(nn.Module):
                         hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
                     )
                 hidden_states = layer_outputs[0]
+                (attention_mask,) = adjust_tensors_for_parallel(hidden_states, attention_mask)                      # CHANGED
 
             if skip_the_layer:
                 layer_outputs = (None, None)
@@ -788,6 +822,7 @@ class HubertEncoderStableLayerNorm(nn.Module):
                         hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
                     )
                 hidden_states = layer_outputs[0]
+                (attention_mask,) = adjust_tensors_for_parallel(hidden_states, attention_mask)
 
             if skip_the_layer:
                 layer_outputs = (None, None)
@@ -939,7 +974,7 @@ HUBERT_INPUTS_DOCSTRING = r"""
     "The bare Hubert Model transformer outputting raw hidden-states without any specific head on top.",
     HUBERT_START_DOCSTRING,
 )
-class HubertModel(HubertPreTrainedModel):
+class HubertModel(HubertModelAdaptersMixin, HubertPreTrainedModel):                                               # CHANGED
     def __init__(self, config: HubertConfig):
         super().__init__(config)
         self.config = config
@@ -953,6 +988,8 @@ class HubertModel(HubertPreTrainedModel):
             self.encoder = HubertEncoderStableLayerNorm(config)
         else:
             self.encoder = HubertEncoder(config)
+
+        self._init_adapter_modules()                                                                                # CHANGED
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1006,6 +1043,7 @@ class HubertModel(HubertPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(HUBERT_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=BaseModelOutput, config_class=_CONFIG_FOR_DOC)
+    @ForwardContext.wrap                                                                                                # CHANGED
     def forward(
         self,
         input_values: Optional[torch.Tensor],
@@ -1083,7 +1121,7 @@ class HubertModel(HubertPreTrainedModel):
     HUBERT_START_DOCSTRING,
 )
 # Copied from transformers.models.wav2vec2.modeling_wav2vec2.Wav2Vec2ForCTC with Wav2Vec2->Hubert, wav2vec2->hubert, WAV_2_VEC_2->HUBERT
-class HubertForCTC(HubertPreTrainedModel):
+class HubertForCTC(ModelWithHeadsAdaptersMixin, HubertPreTrainedModel):                                             # CHANGED
     def __init__(self, config):
         super().__init__(config)
 
@@ -1214,7 +1252,7 @@ class HubertForCTC(HubertPreTrainedModel):
     HUBERT_START_DOCSTRING,
 )
 # Copied from transformers.models.wav2vec2.modeling_wav2vec2.Wav2Vec2ForSequenceClassification with Wav2Vec2->Hubert, wav2vec2->hubert, WAV_2_VEC_2->HUBERT
-class HubertForSequenceClassification(HubertPreTrainedModel):
+class HubertForSequenceClassification(ModelWithHeadsAdaptersMixin, HubertPreTrainedModel):                          # CHANGED
     def __init__(self, config):
         super().__init__(config)
 

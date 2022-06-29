@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...modeling_outputs import (
+    CausalLMOutput,
     MultipleChoiceModelOutput,
     QuestionAnsweringModelOutput,
     Seq2SeqModelOutput,
@@ -15,6 +16,7 @@ from ...modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
+from ...pytorch_utils import torch_int_div
 from ...utils import ModelOutput
 from ..composition import AdapterCompositionBlock, BatchSplit, Parallel, parse_heads_from_composition
 from ..context import AdapterSetup
@@ -275,6 +277,167 @@ class MultipleChoiceHead(PredictionHead):
             if labels is not None:
                 outputs = (loss,) + outputs
             return outputs
+
+# ==============================================================================================
+
+class AudioClassificationHead(PredictionHead):
+    def __init__(
+        self,
+        model,
+        head_name,
+        num_labels=2,
+        layers=1,
+        activation_function="tanh",
+        id2label=None,
+        use_weighted_layer_sum=False,
+        bias=True,
+    ):
+        super().__init__(head_name)
+        self.config = {
+            "head_type": "audio_classification",
+            "num_labels": num_labels,
+            "layers": layers,
+            "activation_function": activation_function,
+            "label2id": {label: id_ for id_, label in id2label.items()} if id2label is not None else None,
+            "use_weighted_layer_sum": use_weighted_layer_sum,
+            "bias": bias,
+        }
+        model_config = model.config
+        self.projector = nn.Linear(model_config.hidden_size, model_config.classifier_proj_size)
+        self.classifier = nn.Linear(model_config.classifier_proj_size, model_config.num_labels)
+
+        if use_weighted_layer_sum:
+            num_layers = model_config.num_hidden_layers + 1
+            self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
+        self.use_weighted_layer_sum = use_weighted_layer_sum
+
+    _HIDDEN_STATES_START_POSITION = 2
+
+    def forward(self, outputs, cls_output=None, attention_mask=None, return_dict=False, **kwargs):
+        if self.use_weighted_layer_sum:
+            hidden_states = outputs[_HIDDEN_STATES_START_POSITION]
+            hidden_states = torch.stack(hidden_states, dim=1)
+            norm_weights = nn.functional.softmax(self.layer_weights, dim=-1)
+            hidden_states = (hidden_states * norm_weights.view(-1, 1, 1)).sum(dim=1)
+        else:
+            hidden_states = outputs[0]
+
+        hidden_states = self.projector(hidden_states)
+        if attention_mask is None:
+            pooled_output = hidden_states.mean(dim=1)
+        else:
+            # TODO _get_feature_vector_attention_mask
+            padding_mask = self._get_feature_vector_attention_mask(hidden_states.shape[1], attention_mask)
+            hidden_states[~padding_mask] = 0.0
+            pooled_output = hidden_states.sum(dim=1) / padding_mask.sum(dim=1).view(-1, 1)
+
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        labels = kwargs.pop("labels", None)
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.config['num_labels']), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[_HIDDEN_STATES_START_POSITION:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class CTCHead(PredictionHead):
+    def __init__(
+        self,
+        model,
+        head_name,
+    ):
+        super().__init__(head_name)
+        model_config = model.config
+        self.model_config = model_config
+
+        self.config = {
+            "head_type": "ctc",
+        }
+        
+        self.dropout = nn.Dropout(model_config.final_dropout)
+
+        if model_config.vocab_size is None:
+            raise ValueError(
+                f"You are trying to instantiate {self.__class__} with a configuration that "
+                "does not define the vocabulary size of the language model head. Please "
+                "instantiate the model as follows: `Wav2Vec2ForCTC.from_pretrained(..., vocab_size=vocab_size)`. "
+                "or define `vocab_size` of your model's configuration."
+            )
+        output_hidden_size = model_config.hidden_size
+        self.lm_head = nn.Linear(output_hidden_size, model_config.vocab_size)
+
+    _HIDDEN_STATES_START_POSITION = 2
+
+    def _get_feat_extract_output_lengths(self, input_lengths: Union[torch.LongTensor, int]):
+        """
+        Computes the output length of the convolutional layers
+        """
+
+        def _conv_out_length(input_length, kernel_size, stride):
+            # 1D convolutional layer output length formula taken
+            # from https://pytorch.org/docs/stable/generated/torch.nn.Conv1d.html
+            return torch_int_div(input_length - kernel_size, stride) + 1
+
+        for kernel_size, stride in zip(self.model_config.conv_kernel, self.model_config.conv_stride):
+            input_lengths = _conv_out_length(input_lengths, kernel_size, stride)
+
+        return input_lengths
+
+    def forward(self, outputs, cls_output=None, attention_mask=None, return_dict=False, **kwargs):
+        hidden_states = outputs[0]
+        hidden_states = self.dropout(hidden_states)
+
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        labels = kwargs.pop("labels", None)
+        if labels is not None:
+            
+            if labels.max() >= self.model_config.vocab_size:
+                raise ValueError(f"Label values must be <= vocab_size: {self.model_config.vocab_size}")
+
+            # retrieve loss input_lengths from attention_mask
+            attention_mask = (
+                attention_mask if attention_mask is not None else torch.ones_like(input_values, dtype=torch.long)
+            )
+            input_lengths = self._get_feat_extract_output_lengths(attention_mask.sum(-1)).to(torch.long)
+
+            labels_mask = labels >= 0
+            target_lengths = labels_mask.sum(-1)
+            flattened_targets = labels.masked_select(labels_mask)
+
+            # ctc_loss doesn't support fp16
+            log_probs = nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32).transpose(0, 1)
+
+            with torch.backends.cudnn.flags(enabled=False):
+                loss = nn.functional.ctc_loss(
+                    log_probs,
+                    flattened_targets,
+                    input_lengths,
+                    target_lengths,
+                    blank=self.model_config.pad_token_id,
+                    reduction=self.model_config.ctc_loss_reduction,
+                    zero_infinity=self.model_config.ctc_zero_infinity,
+                )
+
+        if not return_dict:
+            output = (logits,) + outputs[_HIDDEN_STATES_START_POSITION:]
+            return ((loss,) + output) if loss is not None else output
+
+        return CausalLMOutput(
+            loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
+        )
 
 
 class TaggingHead(PredictionHead):

@@ -106,6 +106,9 @@ _import_structure = {
         "GPT2AdapterModel",
         "GPT2ModelWithHeads",
     ],
+    "models.hubert": [
+        "HubertAdapterModel",
+    ],
     "models.mbart": [
         "MBartAdapterModel",
         "MBartModelWithHeads",
@@ -117,6 +120,9 @@ _import_structure = {
     "models.t5": [
         "T5AdapterModel",
         "T5ModelWithHeads",
+    ],
+    "models.wav2vec2": [
+        "Wav2Vec2AdapterModel",
     ],
     "models.xlm_roberta": [
         "XLMRobertaAdapterModel",
@@ -197,9 +203,11 @@ if TYPE_CHECKING:
     from .models.debertaV2 import DebertaV2AdapterModel
     from .models.distilbert import DistilBertAdapterModel, DistilBertModelWithHeads
     from .models.gpt2 import GPT2AdapterModel, GPT2ModelWithHeads
+    from .models.hubert import HubertAdpaterModel
     from .models.mbart import MBartAdapterModel, MBartModelWithHeads
     from .models.roberta import RobertaAdapterModel, RobertaModelWithHeads
     from .models.t5 import T5AdapterModel, T5ModelWithHeads
+    from .models.wav2vec2 import Wav2Vec2AdapterModel
     from .models.xlm_roberta import XLMRobertaAdapterModel, XLMRobertaModelWithHeads
     from .trainer import AdapterTrainer, Seq2SeqAdapterTrainer
     from .training import AdapterArguments, MultiLingAdapterArguments

@@ -21,6 +21,10 @@ CONFIG_CLASS_KEYS_MAPPING = {
         "hidden_dropout_prob": "resid_pdrop",
         "attention_probs_dropout_prob": "attn_pdrop",
     },
+    "hubert": {
+        "hidden_dropout_prob": "hidden_dropout",
+        "attention_probs_dropout_prob": "attention_dropout",
+    },
     "mbart": {
         "num_attention_heads": "encoder_attention_heads",
         "hidden_size": "d_model",
@@ -34,6 +38,10 @@ CONFIG_CLASS_KEYS_MAPPING = {
         "num_hidden_layers": "num_layers",
         "hidden_dropout_prob": "dropout_rate",
         "attention_probs_dropout_prob": "dropout_rate",
+    },
+    "wav2vec2": {
+        "hidden_dropout_prob": "hidden_dropout",
+        "attention_probs_dropout_prob": "attention_dropout",
     },
     "xlm_roberta": {},
 }
