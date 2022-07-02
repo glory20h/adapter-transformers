@@ -71,6 +71,7 @@ class HubertAdapterModel(ModelWithFlexibleHeadsAdaptersMixin, HubertPreTrainedMo
         # mask_time_indices?
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = True if self.config.use_weighted_layer_sum else output_hidden_states
 
         hubert_outputs = self.hubert(
             input_values,
@@ -80,15 +81,19 @@ class HubertAdapterModel(ModelWithFlexibleHeadsAdaptersMixin, HubertPreTrainedMo
             return_dict=return_dict,
         )
 
-        outputs = self.forward_head(
-            hubert_outputs,
-            input_values=input_values,
-            head_name=head,
-            attention_mask=attention_mask,
-            return_dict=return_dict,
-            labels=labels,
-            **kwargs
-        )
+        if head or AdapterSetup.get_context_head_setup() or self.active_head:
+            outputs = self.forward_head(
+                hubert_outputs,
+                input_values=input_values,
+                head_name=head,
+                attention_mask=attention_mask,
+                return_dict=return_dict,
+                labels=labels,
+                **kwargs
+            )
+        else:
+            # in case no head is used just return the output of the base model (including pooler output)
+            return hubert_outputs
 
         return outputs
 
@@ -101,13 +106,9 @@ class HubertAdapterModel(ModelWithFlexibleHeadsAdaptersMixin, HubertPreTrainedMo
         self,
         head_name,
         num_labels=2,
-        layers=1,
         activation_function="tanh",
         overwrite_ok=False,
-        multilabel=False,
         id2label=None,
-        use_pooler=False,
-        use_weighted_layer_sum=False,
     ):
         """
         Adds a sequence classification head on top of the model.
@@ -115,26 +116,17 @@ class HubertAdapterModel(ModelWithFlexibleHeadsAdaptersMixin, HubertPreTrainedMo
         Args:
             head_name (str): The name of the head.
             num_labels (int, optional): Number of classification labels. Defaults to 2.
-            layers (int, optional): Number of layers. Defaults to 2.
             activation_function (str, optional): Activation function. Defaults to 'tanh'.
             overwrite_ok (bool, optional): Force overwrite if a head with the same name exists. Defaults to False.
-            multilabel (bool, optional): Enable multilabel classification setup. Defaults to False.
         """
 
-        if multilabel:
-            head = MultiLabelClassificationHead(
-                self, head_name, num_labels, layers, activation_function, id2label, use_pooler
-            )
-        else:
-            head = AudioClassificationHead(
-                self,
-                head_name,
-                num_labels,
-                layers,
-                activation_function,
-                id2label,
-                use_weighted_layer_sum,
-            )
+        head = AudioClassificationHead(
+            self,
+            head_name,
+            num_labels,
+            activation_function,
+            id2label,
+        )
         self.add_prediction_head(head, overwrite_ok)
 
     def add_ctc_head(

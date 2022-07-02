@@ -1,5 +1,6 @@
 import functools
 import json
+import logging
 import os
 import re
 import sys
@@ -31,11 +32,12 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 
+logger = logging.getLogger("transformers")
+
 def list_field(default=None, metadata=None):
     return field(default_factory=lambda: default, metadata=metadata)
 
 # ========================================== CONFIG ==========================================
-# MODEL_NAME = "facebook/wav2vec2-large-xlsr-53"
 MODEL_NAME = "facebook/wav2vec2-xls-r-300m"
 # MODEL_NAME = "facebook/wav2vec2-large"
 # MODEL_NAME = "facebook/hubert-large-ll60k"
@@ -43,16 +45,15 @@ MODEL_NAME = "facebook/wav2vec2-xls-r-300m"
 DATASET = "common_voice"
 # DATASET = "superb"
 DATASET_CONFIG = "tr"
-# DATASET_CONFIG = "all"
 # DATASET_CONFIG = "asr"
-TRAIN_SPLIT_NAME = "train+validation"
-# TRAIN_SPLIT_NAME = "train"
-EVAL_SPLIT_NAME = "test"
-# EVAL_SPLIT_NAME = "validation"
-
-EPOCHS = 15
-PER_DEVICE_BATCH_SIZE = 16
-GRADIENT_ACCUMULATION = 1
+TRAIN_SPLIT_NAME = "train"
+EVAL_SPLIT_NAME = "validation"
+TEST_SPLIT_NAME = "test"
+RESUME_TRAINING = False
+EPOCHS = 50
+PER_DEVICE_BATCH_SIZE = 4
+GRADIENT_ACCUMULATION = 4
+PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
 LEARNING_RATE = 3e-4
 # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"
 LR_SCHEDULER_TYPE = "linear"
@@ -63,12 +64,14 @@ GRADIENT_CHECKPOINTING = True
 MAX_DURATION_IN_SECONDS = 20.0
 PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
+FINAL_DROPOUT=0.1
 # 'prefix', 'houlsby', 'pfeiffer', None
 ADAPTER = None
+USE_WEIGHTED_LAYER_SUM = False
 # prefix tuning config
-PREFIX_LENGTH = 600
+PREFIX_LENGTH = 300
 BOTTLENECK_SIZE = 512
-DROPOUT = 0.05
+PREFIX_DROPOUT = 0.05
 # adapter config
 LN_AFTER = True
 REDUCTION_FACTOR = 2
@@ -76,14 +79,15 @@ NON_LINEARITY = "gelu"  # Pfeiffer default: "relu", Houlsby default: "swish"
 # ========================================== CONFIG ==========================================
 
 OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG
+
 if ADAPTER:
     OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER
-    LR_SCHEDULER_TYPE = "constant_with_warmup"
+    LR_SCHEDULER_TYPE = "constant_with_warmup" # Verify this!
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
     
 GRADIENT_CHECKPOINTING = False if ADAPTER == 'prefix' else GRADIENT_CHECKPOINTING
-
-TEXT_COLUMN_NAME = "sentence" if DATASET == "common_voice" else "text"
-
+USE_WEIGHTED_LAYER_SUM = True if ADAPTER else USE_WEIGHTED_LAYER_SUM
 
 @dataclass
 class ModelArguments:
@@ -168,16 +172,21 @@ class DataTrainingArguments:
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
     train_split_name: str = field(
-        default="train+validation",
+        default="train",
         metadata={
-            "help": "The name of the training data set split to use (via the datasets library). Defaults to "
-            "'train+validation'"
+            "help": "The name of the training data set split to use (via the datasets library). Defaults to 'train'"
         },
     )
     eval_split_name: str = field(
+        default="validation",
+        metadata={
+            "help": "The name of the evaluation data set split to use (via the datasets library). Defaults to 'validation'"
+        },
+    )
+    test_split_name: str = field(
         default="test",
         metadata={
-            "help": "The name of the evaluation data set split to use (via the datasets library). Defaults to 'test'"
+            "help": "The name of the test data set split to use (via the datasets library). Defaults to 'test'"
         },
     )
     audio_column_name: str = field(
@@ -324,47 +333,63 @@ class DataCollatorCTCWithPadding:
 
         return batch
 
-def create_vocabulary_from_data(
-    datasets: DatasetDict,
-    word_delimiter_token: Optional[str] = None,
-    unk_token: Optional[str] = None,
-    pad_token: Optional[str] = None,
-):
-    # Given training and test labels create vocabulary
-    def extract_all_chars(batch):
-        all_text = " ".join(batch["target_text"])
-        vocab = list(set(all_text))
-        return {"vocab": [vocab], "all_text": [all_text]}
-    
-    vocabs = datasets.map(
-        extract_all_chars,
-        batched=True,
-        batch_size=-1,
-        keep_in_memory=True,
-        remove_columns=datasets["train"].column_names,
-    )
-    
-    vocab_set = functools.reduce(
-        lambda vocab_1, vocab_2: set(vocab_1["vocab"][0]) | set(vocab_2["vocab"][0]), vocabs.values()
-    )
-    
-    vocab_dict = {v: k for k, v in enumerate(sorted(list(vocab_set)))}
-    
-    # replace white space with delimiter token
-    if word_delimiter_token is not None:
-        vocab_dict[word_delimiter_token] = vocab_dict[" "]
-        del vocab_dict[" "]
-        
-    # add unk and pad token
-    if unk_token is not None:
-        vocab_dict[unk_token] = len(vocab_dict)
-    
-    if pad_token is not None:
-        vocab_dict[pad_token] = len(vocab_dict)
-        
-    return vocab_dict
 
 def main():
+
+    # Setup logging
+    logging_path = os.path.join(OUTPUT_DIR, 'train.log')
+    i = 2
+    while os.path.isfile(logging_path) and not RESUME_TRAINING:
+        logging_path = os.path.join(OUTPUT_DIR, 'train.log')
+        logging_path = logging_path[:-4] + str(i) + logging_path[-4:]
+        i += 1
+        
+    fileHandler = logging.FileHandler(logging_path)
+    # streamHandler = logging.StreamHandler(sys.stdout)
+
+    logger.addHandler(fileHandler)
+    # logger.addHandler(streamHandler)
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+    )
+    logger.setLevel(logging.INFO)
+
+    # Log all args
+    logger.info("MODEL_NAME = " + str(MODEL_NAME))
+    logger.info("DATASET = " + str(DATASET))
+    logger.info("DATASET_CONFIG = " + str(DATASET_CONFIG))
+    logger.info("TRAIN_SPLIT_NAME = " + str(TRAIN_SPLIT_NAME))
+    logger.info("EVAL_SPLIT_NAME = " + str(EVAL_SPLIT_NAME))
+    logger.info("TEST_SPLIT_NAME = " + str(TEST_SPLIT_NAME))
+    logger.info("RESUME_TRAINING = " + str(RESUME_TRAINING))
+    logger.info("EPOCHS = " + str(EPOCHS))
+    logger.info("PER_DEVICE_BATCH_SIZE = " + str(PER_DEVICE_BATCH_SIZE))
+    logger.info("GRADIENT_ACCUMULATION = " + str(GRADIENT_ACCUMULATION))
+    logger.info("PER_DEVICE_EVAL_BATCH_SIZE = " + str(PER_DEVICE_EVAL_BATCH_SIZE))
+    logger.info("LEARNING_RATE = " + str(LEARNING_RATE))
+    logger.info("LR_SCHEDULER_TYPE = " + str(LR_SCHEDULER_TYPE))
+    logger.info("WARMUP_STEPS = " + str(WARMUP_STEPS))
+    logger.info("LOGGING_STEPS = " + str(LOGGING_STEPS))
+    logger.info("EVAL_STEPS = " + str(EVAL_STEPS))
+    logger.info("GRADIENT_CHECKPOINTING = " + str(GRADIENT_CHECKPOINTING))
+    logger.info("MAX_DURATION_IN_SECONDS = " + str(MAX_DURATION_IN_SECONDS))
+    logger.info("PREPROCESSING_NUM_WORKERS = " + str(PREPROCESSING_NUM_WORKERS))
+    logger.info("SET_SEED = " + str(SET_SEED))
+    logger.info("FINAL_DROPOUT = " + str(FINAL_DROPOUT))
+    logger.info("ADAPTER = " + str(ADAPTER))
+
+    if ADAPTER == "prefix":
+        logger.info("PREFIX_LENGTH = " + str(PREFIX_LENGTH))
+        logger.info("BOTTLENECK_SIZE = " + str(BOTTLENECK_SIZE))
+        logger.info("PREFIX_DROPOUT = " + str(PREFIX_DROPOUT))
+    elif ADAPTER:
+        logger.info("LN_AFTER = " + str(LN_AFTER))
+        logger.info("REDUCTION_FACTOR = " + str(REDUCTION_FACTOR))
+        logger.info("NON_LINEARITY = " + str(NON_LINEARITY))
+
+    logger.info("OUTPUT_DIR = " + str(OUTPUT_DIR))
 
     model_args = ModelArguments(
         model_name_or_path=MODEL_NAME,
@@ -377,7 +402,8 @@ def main():
         dataset_config_name=DATASET_CONFIG,
         train_split_name=TRAIN_SPLIT_NAME,
         eval_split_name=EVAL_SPLIT_NAME,
-        text_column_name=TEXT_COLUMN_NAME,
+        test_split_name=TEST_SPLIT_NAME,
+        text_column_name="sentence" if DATASET == "common_voice" else "text",
         preprocessing_num_workers=PREPROCESSING_NUM_WORKERS,
         chars_to_ignore=[',','?','.','!','-','\;','\:','\"','“','%','‘','”','�'],
         eval_metrics=["wer", "cer"],
@@ -386,9 +412,10 @@ def main():
 
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        overwrite_output_dir=True,
+        overwrite_output_dir=True if not RESUME_TRAINING else False,
         num_train_epochs=EPOCHS,
         per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
+        per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,
         learning_rate=LEARNING_RATE,
         lr_scheduler_type=LR_SCHEDULER_TYPE,
@@ -404,51 +431,56 @@ def main():
         fp16=True,
         group_by_length=True,
         load_best_model_at_end=True,
-        do_train=True,
-        do_eval=True,
+        metric_for_best_model="wer",
+        greater_is_better=False,
     )
 
     if SET_SEED:
         set_seed(training_args.seed)
 
+    # Prepare Data
     raw_datasets = DatasetDict()
 
-    # Prepare Training Data
-    if training_args.do_train:
-        raw_datasets["train"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=data_args.train_split_name,
-            use_auth_token=data_args.use_auth_token,
-        )
-        
-        if data_args.audio_column_name not in raw_datasets["train"].column_names:
-            raise ValueError(
-                f"--audio_column_name '{data_args.audio_column_name}' not found in dataset '{data_args.dataset_name}'. "
-                "Make sure to set `--audio_column_name` to the correct audio column - one of "
-                f"{', '.join(raw_datasets['train'].column_names)}."
-            )
+    raw_datasets["train"] = load_dataset(
+        data_args.dataset_name,
+        data_args.dataset_config_name,
+        split=data_args.train_split_name,
+        use_auth_token=data_args.use_auth_token,
+    )
 
-        if data_args.text_column_name not in raw_datasets["train"].column_names:
-            raise ValueError(
-                f"--text_column_name {data_args.text_column_name} not found in dataset '{data_args.dataset_name}'. "
-                "Make sure to set `--text_column_name` to the correct text column - one of "
-                f"{', '.join(raw_datasets['train'].column_names)}."
-            )
-            
-        if data_args.max_train_samples is not None:
-            raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
-                                                                
-    if training_args.do_eval:
-        raw_datasets["eval"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=data_args.eval_split_name,
-            use_auth_token=data_args.use_auth_token,
+    if data_args.audio_column_name not in raw_datasets["train"].column_names:
+        raise ValueError(
+            f"--audio_column_name '{data_args.audio_column_name}' not found in dataset '{data_args.dataset_name}'. "
+            "Make sure to set `--audio_column_name` to the correct audio column - one of "
+            f"{', '.join(raw_datasets['train'].column_names)}."
         )
+
+    if data_args.text_column_name not in raw_datasets["train"].column_names:
+        raise ValueError(
+            f"--text_column_name {data_args.text_column_name} not found in dataset '{data_args.dataset_name}'. "
+            "Make sure to set `--text_column_name` to the correct text column - one of "
+            f"{', '.join(raw_datasets['train'].column_names)}."
+        )
+
+    if data_args.max_train_samples is not None:
+        raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
+                                                                
+    raw_datasets["eval"] = load_dataset(
+        data_args.dataset_name,
+        data_args.dataset_config_name,
+        split=data_args.eval_split_name,
+        use_auth_token=data_args.use_auth_token,
+    )
+
+    if data_args.max_eval_samples is not None:
+        raw_datasets["eval"] = raw_datasets["eval"].select(range(data_args.max_eval_samples))
         
-        if data_args.max_eval_samples is not None:
-            raw_datasets["eval"] = raw_datasets["eval"].select(range(data_args.max_eval_samples))
+    raw_datasets["test"] = load_dataset(
+        data_args.dataset_name,
+        data_args.dataset_config_name,
+        split=data_args.test_split_name,
+        use_auth_token=data_args.use_auth_token,
+    )
 
     chars_to_ignore_regex = (
         f'[{"".join(data_args.chars_to_ignore)}]' if data_args.chars_to_ignore is not None else None
@@ -534,7 +566,7 @@ def main():
 
             with open(vocab_file, "w") as file:
                 json.dump(vocab_dict, file)
-        
+
     tokenizer = Wav2Vec2CTCTokenizer(
         vocab_file=vocab_file,
         unk_token=unk_token,
@@ -557,20 +589,21 @@ def main():
 
     config.update(
         {
-            "feat_proj_dropout": model_args.feat_proj_dropout,
-            "attention_dropout": model_args.attention_dropout,
-            "hidden_dropout": model_args.hidden_dropout,
-            "final_dropout": model_args.final_dropout,
-            "mask_time_prob": model_args.mask_time_prob,
-            "mask_time_length": model_args.mask_time_length,
-            "mask_feature_prob": model_args.mask_feature_prob,
-            "mask_feature_length": model_args.mask_feature_length,
+            # "feat_proj_dropout": model_args.feat_proj_dropout,
+            # "attention_dropout": model_args.attention_dropout,
+            # "hidden_dropout": model_args.hidden_dropout,
+            "final_dropout": FINAL_DROPOUT,
+            # "mask_time_prob": model_args.mask_time_prob,
+            # "mask_time_length": model_args.mask_time_length,
+            # "mask_feature_prob": model_args.mask_feature_prob,
+            # "mask_feature_length": model_args.mask_feature_length,
             "gradient_checkpointing": training_args.gradient_checkpointing,
-            "layerdrop": model_args.layerdrop,
+            # "layerdrop": model_args.layerdrop,
             "ctc_loss_reduction": model_args.ctc_loss_reduction,
             "pad_token_id": tokenizer.pad_token_id,
             "vocab_size": len(tokenizer),
-            "activation_dropout": model_args.activation_dropout,
+            # "activation_dropout": model_args.activation_dropout,
+            "use_weighted_layer_sum": USE_WEIGHTED_LAYER_SUM,
         }
     )
 
@@ -591,9 +624,9 @@ def main():
                 prefix_length=PREFIX_LENGTH,
                 bottleneck_size=BOTTLENECK_SIZE,
                 non_linearity="tanh",
-                dropout=DROPOUT,
+                dropout=PREFIX_DROPOUT,
             )
-            
+
         elif ADAPTER == 'houlsby':
             adapter_config = HoulsbyConfig(
                 ln_after=LN_AFTER,
@@ -610,8 +643,11 @@ def main():
         model.add_adapter("asr-ctc", config=adapter_config, overwrite_ok=True)
         model.train_adapter("asr-ctc")
     else:
-        model.freeze_feature_encoder()
-        
+        if USE_WEIGHTED_LAYER_SUM:
+            model.freeze_base_model()
+        else:
+            model.freeze_feature_encoder()
+
     model.add_ctc_head(
         head_name="asr-ctc",
         overwrite_ok=True,
@@ -621,22 +657,30 @@ def main():
     # head_params = sum(p.numel() for p in model.heads.parameters())
     # adapter_params = trainable_params - head_params
     # if isinstance(adapter_config, PrefixTuningConfig):
-        # prefix = model.wav2vec2.prefix_tuning.prefix_tunings['ctc-adapter'].self_prefix
+        # prefix = model.base_model.prefix_tuning.prefix_tunings['ctc-adapter'].self_prefix
         # adapter_params = prefix.config.prefix_length * prefix.n_layers * 2 * prefix.input_size
 
-    print("Total parameters: ", total_params)
-    print("Trainable parameters: ", trainable_params)
+    logger.info(f"Total parameters: {total_params}")
+    logger.info(f"Trainable parameters: {trainable_params}")
     # print("Adapter parameters: ", adapter_params)
     # print("Head parameters: ", head_params)
-    print("Ratio of trainable parameters: {:.3f}%".format(trainable_params / total_params * 100))
+    logger.info("Ratio of trainable parameters: {:.3f}%".format(trainable_params / total_params * 100))
 
     if ADAPTER == "prefix":
         import copy
-        model_clone = copy.deepcopy(model)
-        model_clone.eject_prefix_tuning("asr-ctc")
-        trainable_params = sum(p.numel() for p in model_clone.parameters() if p.requires_grad)
-        print("[Prefix] Ratio of final trainable parameters: {:.3f}%".format(trainable_params / total_params * 100))
-        del model_clone
+        pool = model.base_model.prefix_tuning.prefix_tunings['asr-ctc']
+        pool_clone = copy.deepcopy(pool)
+        pool_clone.eject()
+        prefix_params = sum(p.numel() for p in pool_clone.parameters() if p.requires_grad)
+        del pool_clone
+        
+        # prefix = model.base_model.prefix_tuning.prefix_tunings['asr-ctc'].self_prefix
+        # prefix_params = prefix.config.prefix_length * prefix.n_layers * 2 * prefix.input_size
+        
+        head_params = sum(p.numel() for p in model.heads.parameters() if p.requires_grad)
+        
+        trainable_params = head_params + prefix_params
+        logger.info("[Prefix] Ratio of final added parameters: {:.3f}%".format(trainable_params / total_params * 100))
 
     dataset_sampling_rate = next(iter(raw_datasets.values())).features[data_args.audio_column_name].sampling_rate
 
@@ -645,7 +689,7 @@ def main():
         raw_datasets = raw_datasets.cast_column(
             data_args.audio_column_name, datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate)
         )
-        
+
     max_input_length = data_args.max_duration_in_seconds * feature_extractor.sampling_rate
     min_input_length = data_args.min_duration_in_seconds * feature_extractor.sampling_rate
     audio_column_name = data_args.audio_column_name
@@ -655,16 +699,16 @@ def main():
     def prepare_dataset(batch):
         # load audio
         sample = batch[audio_column_name]
-        
+
         inputs = processor(sample["array"], sampling_rate=sample["sampling_rate"])
         batch["input_values"] = inputs.input_values[0]
         batch["input_length"] = len(batch["input_values"])
-        
+
         # encode targets
         additional_kwargs = {}
         if phoneme_language is not None:
             additional_kwargs["phonemizer_lang"] = phoneme_language
-        
+
         with processor.as_target_processor():
             batch["labels"] = processor(batch["target_text"], **additional_kwargs).input_ids
         return batch
@@ -675,10 +719,10 @@ def main():
         num_proc=num_workers,
         desc="preprocess datasets",
     )
-    
+
     def is_audio_in_length_range(length):
         return length > min_input_length and length < max_input_length
-    
+
     vectorized_datasets = vectorized_datasets.filter(
         is_audio_in_length_range,
         num_proc=num_workers,
@@ -691,14 +735,14 @@ def main():
     def compute_metrics(pred):
         pred_logits = pred.predictions
         pred_ids = np.argmax(pred_logits, axis=-1)
-        
+
         pred.label_ids[pred.label_ids == -100] = tokenizer.pad_token_id
-        
+
         pred_str = tokenizer.batch_decode(pred_ids)
         label_str = tokenizer.batch_decode(pred.label_ids, group_tokens=False)
-        
+
         metrics = {k: v.compute(predictions=pred_str, references=label_str) for k, v in eval_metrics.items()}
-        
+
         return metrics
 
     trainer_cls = AdapterTrainer if ADAPTER else Trainer
@@ -707,34 +751,27 @@ def main():
         data_collator=data_collator,
         args=training_args,
         compute_metrics=compute_metrics,
-        train_dataset=vectorized_datasets["train"] if training_args.do_train else None,
-        eval_dataset=vectorized_datasets["eval"] if training_args.do_train else None,
+        train_dataset=vectorized_datasets["train"],
+        eval_dataset=vectorized_datasets["eval"],
         tokenizer=feature_extractor,
     )
 
-    # last_checkpoint = None
-    # if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-    #     last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    #     if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-    #         raise ValueError(
-    #             f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-    #             "Use --overwrite_output_dir to overcome."
-    #         )
-    #     elif last_checkpoint is not None:
-    #         logger.info(
-    #             f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-    #             "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-    #         )
+    checkpoint = None
+    if RESUME_TRAINING:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is not None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
+            checkpoint = last_checkpoint
+        else:
+            logger.info(
+                f"RESUME_TRAINING set to True but checkpoint not detected, training from scratch."
+            )
+            checkpoint = None
 
-    # # use last checkpoint if exist
-    # if last_checkpoint is not None:
-    #     checkpoint = last_checkpoint
-    # elif os.path.isdir(model_args.model_name_or_path):
-    #     checkpoint = model_args.model_name_or_path
-    # else:
-    #     checkpoint = None
-
-    train_result = trainer.train(resume_from_checkpoint=None)
+    train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
     trainer.save_model()
     trainer.log_metrics("train", train_result.metrics)
@@ -744,6 +781,10 @@ def main():
     eval_metrics = trainer.evaluate()
     trainer.log_metrics("eval", eval_metrics)
     trainer.save_metrics("eval", eval_metrics)
+
+    test_metrics = trainer.evaluate(vectorized_datasets["test"])
+    trainer.log_metrics("eval", test_metrics)
+    trainer.save_metrics("eval", test_metrics)
 
 if __name__ == "__main__":
     main()
