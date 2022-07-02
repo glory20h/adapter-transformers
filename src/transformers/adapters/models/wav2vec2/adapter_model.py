@@ -82,6 +82,7 @@ class Wav2Vec2AdapterModel(ModelWithFlexibleHeadsAdaptersMixin, Wav2Vec2PreTrain
 
         outputs = self.forward_head(
             wav2vec2_outputs,
+            input_values=input_values,
             head_name=head,
             attention_mask=attention_mask,
             return_dict=return_dict,

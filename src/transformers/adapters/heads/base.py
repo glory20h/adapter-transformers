@@ -411,6 +411,7 @@ class CTCHead(PredictionHead):
                 raise ValueError(f"Label values must be <= vocab_size: {self.model_config.vocab_size}")
 
             # retrieve loss input_lengths from attention_mask
+            input_values = kwargs.pop("input_values", None)
             attention_mask = (
                 attention_mask if attention_mask is not None else torch.ones_like(input_values, dtype=torch.long)
             )

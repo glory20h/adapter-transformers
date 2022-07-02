@@ -82,6 +82,7 @@ class HubertAdapterModel(ModelWithFlexibleHeadsAdaptersMixin, HubertPreTrainedMo
 
         outputs = self.forward_head(
             hubert_outputs,
+            input_values=input_values,
             head_name=head,
             attention_mask=attention_mask,
             return_dict=return_dict,
