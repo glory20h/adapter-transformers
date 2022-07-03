@@ -52,6 +52,7 @@ EVAL_SPLIT_NAME = "validation"
 TEST_SPLIT_NAME = "test"
 RESUME_TRAINING = False
 EPOCHS = 150
+MAX_STEPS = 10000
 PER_DEVICE_BATCH_SIZE = 4
 GRADIENT_ACCUMULATION = 8
 PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
@@ -67,7 +68,7 @@ PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
 FINAL_DROPOUT = 0.1
 # 'prefix', 'houlsby', 'pfeiffer', None
-ADAPTER = 'prefix'
+ADAPTER = None
 USE_WEIGHTED_LAYER_SUM = True
 # prefix tuning config
 PREFIX_LENGTH = 200
@@ -79,11 +80,10 @@ REDUCTION_FACTOR = 2
 NON_LINEARITY = "gelu"  # Pfeiffer default: "relu", Houlsby default: "swish"
 # ========================================== CONFIG ==========================================
 
-OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG
+OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG + "-only_w_sum"
 
 if ADAPTER:
-    OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(PREFIX_LENGTH) + "-linear"
-    LR_SCHEDULER_TYPE = "linear" # Verify this!
+    OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(PREFIX_LENGTH)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
     
@@ -366,6 +366,7 @@ def main():
     logger.info("TEST_SPLIT_NAME = " + str(TEST_SPLIT_NAME))
     logger.info("RESUME_TRAINING = " + str(RESUME_TRAINING))
     logger.info("EPOCHS = " + str(EPOCHS))
+    logger.info("MAX_STEPS = " + str(MAX_STEPS))
     logger.info("PER_DEVICE_BATCH_SIZE = " + str(PER_DEVICE_BATCH_SIZE))
     logger.info("GRADIENT_ACCUMULATION = " + str(GRADIENT_ACCUMULATION))
     logger.info("PER_DEVICE_EVAL_BATCH_SIZE = " + str(PER_DEVICE_EVAL_BATCH_SIZE))
@@ -415,6 +416,7 @@ def main():
         output_dir=OUTPUT_DIR,
         overwrite_output_dir=True if not RESUME_TRAINING else False,
         num_train_epochs=EPOCHS,
+        max_steps=MAX_STEPS,
         per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
         per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,
