@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Union
 import datasets
 import numpy as np
 import torch
-from datasets import DatasetDict, load_dataset, load_metric
+from datasets import DatasetDict, load_dataset, load_metric, load_from_disk
 
 import transformers
 from transformers import (
@@ -24,6 +24,7 @@ from transformers import (
     HubertAdapterModel,
     Trainer,
     AdapterTrainer,
+    TrainerCallback,
     TrainingArguments,
     PrefixTuningConfig,
     PfeifferConfig,
@@ -50,9 +51,9 @@ TRAIN_SPLIT_NAME = "train"
 EVAL_SPLIT_NAME = "validation"
 TEST_SPLIT_NAME = "test"
 RESUME_TRAINING = False
-EPOCHS = 50
+EPOCHS = 150
 PER_DEVICE_BATCH_SIZE = 4
-GRADIENT_ACCUMULATION = 4
+GRADIENT_ACCUMULATION = 8
 PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
 LEARNING_RATE = 3e-4
 # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"
@@ -64,12 +65,12 @@ GRADIENT_CHECKPOINTING = True
 MAX_DURATION_IN_SECONDS = 20.0
 PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
-FINAL_DROPOUT=0.1
+FINAL_DROPOUT = 0.1
 # 'prefix', 'houlsby', 'pfeiffer', None
-ADAPTER = None
-USE_WEIGHTED_LAYER_SUM = False
+ADAPTER = 'prefix'
+USE_WEIGHTED_LAYER_SUM = True
 # prefix tuning config
-PREFIX_LENGTH = 300
+PREFIX_LENGTH = 200
 BOTTLENECK_SIZE = 512
 PREFIX_DROPOUT = 0.05
 # adapter config
@@ -81,8 +82,8 @@ NON_LINEARITY = "gelu"  # Pfeiffer default: "relu", Houlsby default: "swish"
 OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG
 
 if ADAPTER:
-    OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER
-    LR_SCHEDULER_TYPE = "constant_with_warmup" # Verify this!
+    OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(PREFIX_LENGTH) + "-linear"
+    LR_SCHEDULER_TYPE = "linear" # Verify this!
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
     
@@ -682,44 +683,52 @@ def main():
         trainable_params = head_params + prefix_params
         logger.info("[Prefix] Ratio of final added parameters: {:.3f}%".format(trainable_params / total_params * 100))
 
-    dataset_sampling_rate = next(iter(raw_datasets.values())).features[data_args.audio_column_name].sampling_rate
+    processed_data_path = os.path.join("./dataset", DATASET + "-" + DATASET_CONFIG)
 
-    if dataset_sampling_rate != feature_extractor.sampling_rate:
-        # datasets can take care of automatically loading and resampling the audio
-        raw_datasets = raw_datasets.cast_column(
-            data_args.audio_column_name, datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate)
-        )
-
-    max_input_length = data_args.max_duration_in_seconds * feature_extractor.sampling_rate
-    min_input_length = data_args.min_duration_in_seconds * feature_extractor.sampling_rate
     audio_column_name = data_args.audio_column_name
     num_workers = data_args.preprocessing_num_workers
     phoneme_language = data_args.phoneme_language
+    max_input_length = data_args.max_duration_in_seconds * feature_extractor.sampling_rate
+    min_input_length = data_args.min_duration_in_seconds * feature_extractor.sampling_rate
 
-    def prepare_dataset(batch):
-        # load audio
-        sample = batch[audio_column_name]
+    try:
+        vectorized_datasets = load_from_disk(processed_data_path)
+    except:
+        dataset_sampling_rate = next(iter(raw_datasets.values())).features[data_args.audio_column_name].sampling_rate
 
-        inputs = processor(sample["array"], sampling_rate=sample["sampling_rate"])
-        batch["input_values"] = inputs.input_values[0]
-        batch["input_length"] = len(batch["input_values"])
+        if dataset_sampling_rate != feature_extractor.sampling_rate:
+            # datasets can take care of automatically loading and resampling the audio
+            raw_datasets = raw_datasets.cast_column(
+                audio_column_name, datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate)
+            )
 
-        # encode targets
-        additional_kwargs = {}
-        if phoneme_language is not None:
-            additional_kwargs["phonemizer_lang"] = phoneme_language
+        def prepare_dataset(batch):
+            # load audio
+            sample = batch[audio_column_name]
 
-        with processor.as_target_processor():
-            batch["labels"] = processor(batch["target_text"], **additional_kwargs).input_ids
-        return batch
+            inputs = processor(sample["array"], sampling_rate=sample["sampling_rate"])
+            batch["input_values"] = inputs.input_values[0]
+            batch["input_length"] = len(batch["input_values"])
 
-    vectorized_datasets = raw_datasets.map(
-        prepare_dataset,
-        remove_columns=next(iter(raw_datasets.values())).column_names,
-        num_proc=num_workers,
-        desc="preprocess datasets",
-    )
+            # encode targets
+            additional_kwargs = {}
+            if phoneme_language is not None:
+                additional_kwargs["phonemizer_lang"] = phoneme_language
 
+            with processor.as_target_processor():
+                batch["labels"] = processor(batch["target_text"], **additional_kwargs).input_ids
+            return batch
+
+        vectorized_datasets = raw_datasets.map(
+            prepare_dataset,
+            remove_columns=next(iter(raw_datasets.values())).column_names,
+            num_proc=num_workers,
+            desc="preprocess datasets",
+        )
+        
+        os.makedirs(processed_data_path, exist_ok=True)
+        vectorized_datasets.save_to_disk(processed_data_path)
+        
     def is_audio_in_length_range(length):
         return length > min_input_length and length < max_input_length
 
@@ -745,6 +754,12 @@ def main():
 
         return metrics
 
+    class LogCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            # _ = logs.pop("total_flos", None)
+            if state.is_local_process_zero:
+                logger.info(str(logs))
+
     trainer_cls = AdapterTrainer if ADAPTER else Trainer
     trainer = trainer_cls(
         model=model,
@@ -754,6 +769,7 @@ def main():
         train_dataset=vectorized_datasets["train"],
         eval_dataset=vectorized_datasets["eval"],
         tokenizer=feature_extractor,
+        callbacks=[LogCallback],
     )
 
     checkpoint = None
@@ -778,13 +794,13 @@ def main():
     trainer.save_metrics("train", train_result.metrics)
     trainer.save_state()
 
-    eval_metrics = trainer.evaluate()
-    trainer.log_metrics("eval", eval_metrics)
-    trainer.save_metrics("eval", eval_metrics)
+    eval_results = trainer.evaluate()
+    trainer.log_metrics("eval", eval_results)
+    trainer.save_metrics("eval", eval_results)
 
-    test_metrics = trainer.evaluate(vectorized_datasets["test"])
-    trainer.log_metrics("eval", test_metrics)
-    trainer.save_metrics("eval", test_metrics)
+    test_results = trainer.evaluate(vectorized_datasets["test"])
+    trainer.log_metrics("eval", test_results)
+    trainer.save_metrics("eval", test_results)
 
 if __name__ == "__main__":
     main()
