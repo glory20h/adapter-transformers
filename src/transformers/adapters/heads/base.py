@@ -289,7 +289,6 @@ class AudioClassificationHead(PredictionHead):
         model,
         head_name,
         num_labels=2,
-        activation_function="tanh",
         id2label=None,
     ):
         super().__init__(head_name)
@@ -298,18 +297,15 @@ class AudioClassificationHead(PredictionHead):
         self.config = {
             "head_type": "audio_classification",
             "num_labels": num_labels,
-            "activation_function": activation_function,
             "label2id": {label: id_ for id_, label in id2label.items()} if id2label is not None else None,
-            "use_weighted_layer_sum": use_weighted_layer_sum,
         }
 
-        self.projector = nn.Linear(model_config.hidden_size, model_config.classifier_proj_size)
-        self.classifier = nn.Linear(model_config.classifier_proj_size, num_labels)
-
-        if model_config.use_weighted_layer_sum:
+        if self.model_config.use_weighted_layer_sum:
             num_layers = model_config.num_hidden_layers + 1
             self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
-        self.use_weighted_layer_sum = use_weighted_layer_sum
+
+        self.projector = nn.Linear(self.model_config.hidden_size, self.model_config.classifier_proj_size)
+        self.classifier = nn.Linear(self.model_config.classifier_proj_size, num_labels)
 
     def _get_feat_extract_output_lengths(self, input_lengths: Union[torch.LongTensor, int]):
         """
@@ -345,8 +341,8 @@ class AudioClassificationHead(PredictionHead):
         return attention_mask
 
     def forward(self, outputs, cls_output=None, attention_mask=None, return_dict=False, **kwargs):
-        if self.use_weighted_layer_sum:
-            hidden_states = outputs[2]
+        if self.model_config.use_weighted_layer_sum:
+            hidden_states = outputs.hidden_states
             hidden_states = torch.stack(hidden_states, dim=1)
             norm_weights = nn.functional.softmax(self.layer_weights, dim=-1)
             hidden_states = (hidden_states * norm_weights.view(-1, 1, 1)).sum(dim=1)
@@ -427,7 +423,7 @@ class CTCHead(PredictionHead):
 
     def forward(self, outputs, cls_output=None, attention_mask=None, return_dict=False, **kwargs):
         if self.model_config.use_weighted_layer_sum:
-            hidden_states = outputs[2]
+            hidden_states = outputs.hidden_states
             hidden_states = torch.stack(hidden_states, dim=1)
             norm_weights = nn.functional.softmax(self.layer_weights, dim=-1)
             hidden_states = (hidden_states * norm_weights.view(-1, 1, 1)).sum(dim=1)
@@ -475,7 +471,7 @@ class CTCHead(PredictionHead):
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutput(
-            loss=loss, logits=logits, hidden_states=None, attentions=None
+            loss=loss, logits=logits, hidden_states=None, attentions=outputs.attentions
         )
 
 

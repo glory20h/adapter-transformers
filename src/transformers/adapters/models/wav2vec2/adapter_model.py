@@ -106,7 +106,6 @@ class Wav2Vec2AdapterModel(ModelWithFlexibleHeadsAdaptersMixin, Wav2Vec2PreTrain
         self,
         head_name,
         num_labels=2,
-        activation_function="tanh",
         overwrite_ok=False,
         id2label=None,
     ):
@@ -124,7 +123,6 @@ class Wav2Vec2AdapterModel(ModelWithFlexibleHeadsAdaptersMixin, Wav2Vec2PreTrain
             self,
             head_name,
             num_labels,
-            activation_function,
             id2label,
         )
         self.add_prediction_head(head, overwrite_ok)
