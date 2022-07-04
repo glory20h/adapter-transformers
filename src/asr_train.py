@@ -43,18 +43,18 @@ MODEL_NAME = "facebook/wav2vec2-xls-r-300m"
 # MODEL_NAME = "facebook/wav2vec2-large"
 # MODEL_NAME = "facebook/hubert-large-ll60k"
 # MODEL_NAME = "facebook/hubert-base-ls960"
-DATASET = "common_voice"
-# DATASET = "superb"
-DATASET_CONFIG = "tr"
-# DATASET_CONFIG = "asr"
+# DATASET = "common_voice"
+DATASET = "superb"
+# DATASET_CONFIG = "tr"
+DATASET_CONFIG = "asr"
 TRAIN_SPLIT_NAME = "train"
 EVAL_SPLIT_NAME = "validation"
 TEST_SPLIT_NAME = "test"
 RESUME_TRAINING = False
 EPOCHS = 150
 MAX_STEPS = 10000
-PER_DEVICE_BATCH_SIZE = 4
-GRADIENT_ACCUMULATION = 8
+PER_DEVICE_BATCH_SIZE = 1
+GRADIENT_ACCUMULATION = 32
 PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
 LEARNING_RATE = 3e-4
 # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"
@@ -68,10 +68,10 @@ PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
 FINAL_DROPOUT = 0.1
 # 'prefix', 'houlsby', 'pfeiffer', None
-ADAPTER = None
+ADAPTER = 'prefix'
 USE_WEIGHTED_LAYER_SUM = True
 # prefix tuning config
-PREFIX_LENGTH = 200
+PREFIX_LENGTH = 50
 BOTTLENECK_SIZE = 512
 PREFIX_DROPOUT = 0.05
 # adapter config
@@ -80,7 +80,7 @@ REDUCTION_FACTOR = 2
 NON_LINEARITY = "gelu"  # Pfeiffer default: "relu", Houlsby default: "swish"
 # ========================================== CONFIG ==========================================
 
-OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG + "-only_w_sum"
+OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG
 
 if ADAPTER:
     OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(PREFIX_LENGTH)
@@ -381,6 +381,7 @@ def main():
     logger.info("SET_SEED = " + str(SET_SEED))
     logger.info("FINAL_DROPOUT = " + str(FINAL_DROPOUT))
     logger.info("ADAPTER = " + str(ADAPTER))
+    logger.info("USE_WEIGHTED_LAYER_SUM = " + str(USE_WEIGHTED_LAYER_SUM))
 
     if ADAPTER == "prefix":
         logger.info("PREFIX_LENGTH = " + str(PREFIX_LENGTH))
