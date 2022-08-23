@@ -301,7 +301,7 @@ class AudioClassificationHead(PredictionHead):
         }
 
         if self.model_config.use_weighted_layer_sum:
-            num_layers = model_config.num_hidden_layers + 1
+            num_layers = self.model_config.num_hidden_layers + 1
             self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
 
         self.projector = nn.Linear(self.model_config.hidden_size, self.model_config.classifier_proj_size)

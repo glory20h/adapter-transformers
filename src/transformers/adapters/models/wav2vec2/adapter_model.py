@@ -99,7 +99,7 @@ class Wav2Vec2AdapterModel(ModelWithFlexibleHeadsAdaptersMixin, Wav2Vec2PreTrain
 
     head_types = {
         "ctc": CTCHead,
-        "classification": AudioClassificationHead,
+        "audio_classification": AudioClassificationHead,
     }
 
     def add_classification_head(

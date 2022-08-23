@@ -99,7 +99,7 @@ class HubertAdapterModel(ModelWithFlexibleHeadsAdaptersMixin, HubertPreTrainedMo
 
     head_types = {
         "ctc": CTCHead,
-        "classification": AudioClassificationHead,
+        "audio_classification": AudioClassificationHead,
     }
 
     def add_classification_head(
