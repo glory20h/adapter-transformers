@@ -44,19 +44,23 @@ MODEL_NAME = "facebook/wav2vec2-xls-r-300m"
 # MODEL_NAME = "facebook/hubert-large-ll60k"
 # MODEL_NAME = "facebook/hubert-base-ls960"
 # DATASET = "common_voice"
-DATASET = "superb"
+DATASET = "mozilla-foundation/common_voice_3_0"
+# DATASET = "superb"
 # DATASET_CONFIG = "tr"
-DATASET_CONFIG = "asr"
+DATASET_CONFIG = "es"
+# DATASET_CONFIG = "asr"
 TRAIN_SPLIT_NAME = "train"
 EVAL_SPLIT_NAME = "validation"
 TEST_SPLIT_NAME = "test"
+FORCE_REDOWNLOAD = True
 RESUME_TRAINING = False
 EPOCHS = 150
-MAX_STEPS = 10000
-PER_DEVICE_BATCH_SIZE = 1
-GRADIENT_ACCUMULATION = 32
+# -1 to disable
+MAX_STEPS = 20000       
+PER_DEVICE_BATCH_SIZE = 2
+GRADIENT_ACCUMULATION = 8
 PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 1e-4
 # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"
 LR_SCHEDULER_TYPE = "linear"
 WARMUP_STEPS = 500
@@ -68,12 +72,12 @@ PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
 FINAL_DROPOUT = 0.1
 # 'prefix', 'houlsby', 'pfeiffer', None
-ADAPTER = 'prefix'
-USE_WEIGHTED_LAYER_SUM = True
+ADAPTER = None
+USE_WEIGHTED_LAYER_SUM = False
 # prefix tuning config
-PREFIX_LENGTH = 50
-BOTTLENECK_SIZE = 512
-PREFIX_DROPOUT = 0.05
+PREFIX_LENGTH = 100
+BOTTLENECK_SIZE = 1024
+PREFIX_DROPOUT = 0
 # adapter config
 LN_AFTER = True
 REDUCTION_FACTOR = 2
@@ -406,7 +410,7 @@ def main():
         train_split_name=TRAIN_SPLIT_NAME,
         eval_split_name=EVAL_SPLIT_NAME,
         test_split_name=TEST_SPLIT_NAME,
-        text_column_name="sentence" if DATASET == "common_voice" else "text",
+        text_column_name="sentence" if "common_voice" in DATASET else "text",
         preprocessing_num_workers=PREPROCESSING_NUM_WORKERS,
         chars_to_ignore=[',','?','.','!','-','\;','\:','\"','“','%','‘','”','�'],
         eval_metrics=["wer", "cer"],
@@ -450,6 +454,7 @@ def main():
         data_args.dataset_config_name,
         split=data_args.train_split_name,
         use_auth_token=data_args.use_auth_token,
+        download_mode="force_redownload" if FORCE_REDOWNLOAD else None,
     )
 
     if data_args.audio_column_name not in raw_datasets["train"].column_names:
@@ -532,9 +537,9 @@ def main():
             remove_columns=datasets["train"].column_names,
         )
         
-        vocab_set = functools.reduce(
-            lambda vocab_1, vocab_2: set(vocab_1["vocab"][0]) | set(vocab_2["vocab"][0]), vocabs.values()
-        )
+        vocab_set = set()
+        for i, dataset in enumerate(vocabs.values()):
+            vocab_set = vocab_set | set(dataset['vocab'][0])
         
         vocab_dict = {v: k for k, v in enumerate(sorted(list(vocab_set)))}
         
@@ -556,7 +561,9 @@ def main():
     unk_token = data_args.unk_token
     pad_token = data_args.pad_token
 
-    vocab_file = os.path.join('./vocab', "vocab-" + DATASET + "-" + DATASET_CONFIG + ".json")
+    data_name = DATASET.split('/')[-1] if 'mozilla' in DATASET else DATASET
+
+    vocab_file = os.path.join('./vocab', "vocab-" + data_name + "-" + DATASET_CONFIG + ".json")
 
     with training_args.main_process_first(desc="dataset map vocabulary creation"):
         if not os.path.isfile(vocab_file):
