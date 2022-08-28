@@ -62,7 +62,7 @@ WARMUP_STEPS = 500
 LOGGING_STEPS = 100
 EVAL_STEPS = 400
 GRADIENT_CHECKPOINTING = True
-MAX_DURATION_IN_SECONDS = 20.0
+MAX_LENGTH_SECONDS = 20.0
 PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
 FINAL_DROPOUT = 0.1
@@ -263,7 +263,7 @@ def main():
     logger.info("LOGGING_STEPS = " + str(LOGGING_STEPS))
     logger.info("EVAL_STEPS = " + str(EVAL_STEPS))
     logger.info("GRADIENT_CHECKPOINTING = " + str(GRADIENT_CHECKPOINTING))
-    logger.info("MAX_DURATION_IN_SECONDS = " + str(MAX_DURATION_IN_SECONDS))
+    logger.info("MAX_LENGTH_SECONDS = " + str(MAX_LENGTH_SECONDS))
     logger.info("PREPROCESSING_NUM_WORKERS = " + str(PREPROCESSING_NUM_WORKERS))
     logger.info("SET_SEED = " + str(SET_SEED))
     logger.info("FINAL_DROPOUT = " + str(FINAL_DROPOUT))
@@ -295,7 +295,7 @@ def main():
         test_split_name=TEST_SPLIT_NAME,
         preprocessing_num_workers=PREPROCESSING_NUM_WORKERS,
         eval_metrics=["accuracy"],
-        max_duration_in_seconds=MAX_DURATION_IN_SECONDS,
+        max_length_seconds=MAX_LENGTH_SECONDS,
     )
 
     training_args = TrainingArguments(
@@ -412,7 +412,7 @@ def main():
         output_batch = {"input_values": []}
         for audio in batch[data_args.audio_column_name]:
             wav = random_subsample(
-                audio['array'], max_length=data_args.max_duration_in_seconds, sample_rate=feature_extractor.sampling_rate
+                audio['array'], max_length=data_args.max_length_seconds, sample_rate=feature_extractor.sampling_rate
             )
             output_batch['input_values'].append(wav)
         output_batch['labels'] = [label for label in batch[data_args.label_column_name]]
