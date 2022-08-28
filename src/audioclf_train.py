@@ -43,12 +43,15 @@ def list_field(default=None, metadata=None):
 # MODEL_NAME = "facebook/hubert-large-ll60k"
 MODEL_NAME = "facebook/hubert-base-ls960"
 DATASET = "superb"
-DATASET_CONFIG = "ks"
+DATASET_CONFIG = "si"
+DATA_DIR = "./dataset/VoxCeleb1"
 TRAIN_SPLIT_NAME = "train"
 EVAL_SPLIT_NAME = "validation"
 TEST_SPLIT_NAME = "test"
 RESUME_TRAINING = False
-MAX_STEPS = 10000
+EPOCHS = 150
+# -1 to disable
+MAX_STEPS = 20000
 PER_DEVICE_BATCH_SIZE = 8
 GRADIENT_ACCUMULATION = 1
 PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
@@ -95,15 +98,22 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
-    )
-    tokenizer_name_or_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to pretrained tokenizer or tokenizer identifier from huggingface.co/models"},
+        default="facebook/wav2vec2-base",
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"},
     )
     cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
+        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from the Hub"}
+    )
+    model_revision: str = field(
+        default="main",
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={
+            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
+            "with private models)."
+        },
     )
     freeze_feature_encoder: bool = field(
         default=True, metadata={"help": "Whether to freeze the feature encoder layers of the model."}
@@ -128,29 +138,6 @@ class ModelArguments:
         default=0.0,
         metadata={"help": "The dropout probability for the final projection layer."},
     )
-    mask_time_prob: float = field(
-        default=0.05,
-        metadata={
-            "help": "Probability of each feature vector along the time axis to be chosen as the start of the vector"
-            "span to be masked. Approximately ``mask_time_prob * sequence_length // mask_time_length`` feature"
-            "vectors will be masked along the time axis."
-        },
-    )
-    mask_time_length: int = field(
-        default=10,
-        metadata={"help": "Length of vector span to mask along the time axis."},
-    )
-    mask_feature_prob: float = field(
-        default=0.0,
-        metadata={
-            "help": "Probability of each feature vector along the feature axis to be chosen as the start of the vector"
-            "span to be masked. Approximately ``mask_feature_prob * sequence_length // mask_feature_length`` feature bins will be masked along the time axis."
-        },
-    )
-    mask_feature_length: int = field(
-        default=10,
-        metadata={"help": "Length of vector span to mask along the feature axis."},
-    )
     layerdrop: float = field(default=0.0, metadata={"help": "The LayerDrop probability."})
 
 
@@ -158,17 +145,26 @@ class ModelArguments:
 class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
-
     Using `HfArgumentParser` we can turn this class
     into argparse arguments to be able to specify them on
     the command line.
     """
 
-    dataset_name: str = field(
-        metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    dataset_name: Optional[str] = field(
+        default=None, metadata={"help": "Name of a dataset from the datasets package"}
     )
-    dataset_config_name: str = field(
+    dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={
+            "help": "If :obj:`True`, will use the token generated when running"
+            ":obj:`transformers-cli login` as HTTP bearer authorization for remote files."
+        },
+    )
+    data_dir: Optional[str] = field(
+        default=None, metadata={"help": "Path to manual data containing the training audio paths and labels."}
     )
     train_split_name: str = field(
         default="train",
@@ -179,7 +175,8 @@ class DataTrainingArguments:
     eval_split_name: str = field(
         default="validation",
         metadata={
-            "help": "The name of the evaluation data set split to use (via the datasets library). Defaults to 'validation'"
+            "help": "The name of the training data set split to use (via the datasets library). Defaults to "
+            "'validation'"
         },
     )
     test_split_name: str = field(
@@ -193,8 +190,7 @@ class DataTrainingArguments:
         metadata={"help": "The name of the dataset column containing the audio data. Defaults to 'audio'"},
     )
     label_column_name: str = field(
-        default="label",
-        metadata={"help": "The name of the dataset column containing the text data. Defaults to 'text'"},
+        default="label", metadata={"help": "The name of the dataset column containing the labels. Defaults to 'label'"}
     )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
@@ -213,7 +209,7 @@ class DataTrainingArguments:
     max_eval_samples: Optional[int] = field(
         default=None,
         metadata={
-            "help": "For debugging purposes or quicker training, truncate the number of validation examples to this "
+            "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
             "value if set."
         },
     )
@@ -221,30 +217,9 @@ class DataTrainingArguments:
         default=["acc"],
         metadata={"help": "A list of metrics the model should be evaluated on. E.g. `'acc'`"},
     )
-    max_duration_in_seconds: float = field(
-        default=20.0,
-        metadata={
-            "help": "Filter audio files that are longer than `max_duration_in_seconds` seconds to 'max_duration_in_seconds`"
-        },
-    )
-    min_duration_in_seconds: float = field(
-        default=0.0, metadata={"help": "Filter audio files that are shorter than `min_duration_in_seconds` seconds"}
-    )
-    preprocessing_only: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to only do data preprocessing and skip training. "
-            "This is especially useful when data preprocessing errors out in distributed training due to timeout. "
-            "In this case, one should run the preprocessing in a non-distributed setup with `preprocessing_only=True` "
-            "so that the cached datasets can consequently be loaded in distributed training"
-        },
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": "If :obj:`True`, will use the token generated when running"
-            ":obj:`transformers-cli login` as HTTP bearer authorization for remote files."
-        },
+    max_length_seconds: float = field(
+        default=20,
+        metadata={"help": "Audio clips will be randomly cut to this length during training if the value is set."},
     )
 
 
@@ -354,6 +329,7 @@ def main():
         model_args.model_name_or_path,
         return_attention_mask=model_args.attention_mask,
         cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
         use_auth_token=data_args.use_auth_token,
     )
 
@@ -368,6 +344,7 @@ def main():
         raw_datasets["train"] = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
+            data_dir=data_args.data_dir,
             split=data_args.train_split_name,
             use_auth_token=data_args.use_auth_token,
         )
@@ -392,6 +369,7 @@ def main():
         raw_datasets["eval"] = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
+            data_dir=data_args.data_dir,
             split=data_args.eval_split_name,
             use_auth_token=data_args.use_auth_token,
         )
@@ -402,6 +380,7 @@ def main():
         raw_datasets["test"] = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
+            data_dir=data_args.data_dir,
             split=data_args.test_split_name,
             use_auth_token=data_args.use_auth_token,
         )
@@ -462,6 +441,7 @@ def main():
     config = config_cls.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
         use_auth_token=data_args.use_auth_token,
     )
 
@@ -487,6 +467,7 @@ def main():
         model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         config=config,
+        revision=model_args.model_revision,
         use_auth_token=data_args.use_auth_token,
     )
 
@@ -501,7 +482,6 @@ def main():
                 non_linearity="tanh",
                 dropout=PREFIX_DROPOUT,
             )
-
         elif ADAPTER == 'houlsby':
             adapter_config = HoulsbyConfig(
                 ln_after=LN_AFTER,

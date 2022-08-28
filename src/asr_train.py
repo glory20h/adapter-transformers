@@ -52,7 +52,7 @@ DATASET_CONFIG = "es"
 TRAIN_SPLIT_NAME = "train"
 EVAL_SPLIT_NAME = "validation"
 TEST_SPLIT_NAME = "test"
-FORCE_REDOWNLOAD = True
+FORCE_REDOWNLOAD = False
 RESUME_TRAINING = False
 EPOCHS = 150
 # -1 to disable
@@ -73,10 +73,9 @@ SET_SEED = False
 FINAL_DROPOUT = 0.1
 # 'prefix', 'houlsby', 'pfeiffer', None
 ADAPTER = None
-USE_WEIGHTED_LAYER_SUM = False
 # prefix tuning config
 PREFIX_LENGTH = 100
-BOTTLENECK_SIZE = 1024
+BOTTLENECK_SIZE = 512
 PREFIX_DROPOUT = 0
 # adapter config
 LN_AFTER = True
@@ -92,7 +91,7 @@ if ADAPTER:
 os.makedirs(OUTPUT_DIR, exist_ok=True)
     
 GRADIENT_CHECKPOINTING = False if ADAPTER == 'prefix' else GRADIENT_CHECKPOINTING
-USE_WEIGHTED_LAYER_SUM = True if ADAPTER else USE_WEIGHTED_LAYER_SUM
+USE_WEIGHTED_LAYER_SUM = True if ADAPTER else False
 
 @dataclass
 class ModelArguments:
