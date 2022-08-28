@@ -290,6 +290,7 @@ def main():
     data_args = DataTrainingArguments(
         dataset_name=DATASET,
         dataset_config_name=DATASET_CONFIG,
+        data_dir=DATA_DIR,
         train_split_name=TRAIN_SPLIT_NAME,
         eval_split_name=EVAL_SPLIT_NAME,
         test_split_name=TEST_SPLIT_NAME,
