@@ -270,11 +270,12 @@ def main():
     logger.info("ADAPTER = " + str(ADAPTER))
     logger.info("USE_WEIGHTED_LAYER_SUM = " + str(USE_WEIGHTED_LAYER_SUM))
 
-    if ADAPTER == "prefix":
+    if ADAPTER in ["prefix", "union"]:
         logger.info("PREFIX_LENGTH = " + str(PREFIX_LENGTH))
         logger.info("BOTTLENECK_SIZE = " + str(BOTTLENECK_SIZE))
         logger.info("PREFIX_DROPOUT = " + str(PREFIX_DROPOUT))
-    elif ADAPTER:
+
+    if ADAPTER in ["houlsby", "pfeiffer", "union"]:
         logger.info("LN_AFTER = " + str(LN_AFTER))
         logger.info("REDUCTION_FACTOR = " + str(REDUCTION_FACTOR))
         logger.info("NON_LINEARITY = " + str(NON_LINEARITY))

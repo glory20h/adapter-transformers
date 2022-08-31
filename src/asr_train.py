@@ -29,6 +29,7 @@ from transformers import (
     PrefixTuningConfig,
     PfeifferConfig,
     HoulsbyConfig,
+    ConfigUnion,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
@@ -46,8 +47,8 @@ MODEL_NAME = "facebook/wav2vec2-xls-r-300m"
 # DATASET = "common_voice"
 DATASET = "mozilla-foundation/common_voice_3_0"
 # DATASET = "superb"
-# DATASET_CONFIG = "tr"
-DATASET_CONFIG = "es"
+DATASET_CONFIG = "tr"
+# DATASET_CONFIG = "es"
 # DATASET_CONFIG = "asr"
 TRAIN_SPLIT_NAME = "train"
 EVAL_SPLIT_NAME = "validation"
@@ -71,26 +72,30 @@ MAX_DURATION_IN_SECONDS = 20.0
 PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
 FINAL_DROPOUT = 0.1
-# 'prefix', 'houlsby', 'pfeiffer', None
+# 'prefix', 'houlsby', 'pfeiffer', 'union', None
 ADAPTER = None
 # prefix tuning config
 PREFIX_LENGTH = 100
 BOTTLENECK_SIZE = 512
-PREFIX_DROPOUT = 0
+PREFIX_DROPOUT = 0.05
 # adapter config
-LN_AFTER = True
-REDUCTION_FACTOR = 2
-NON_LINEARITY = "gelu"  # Pfeiffer default: "relu", Houlsby default: "swish"
+LN_AFTER = False
+REDUCTION_FACTOR = 16
+NON_LINEARITY = "swish"  # Pfeiffer default: "relu", Houlsby default: "swish"
 # ========================================== CONFIG ==========================================
 
 OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG
 
-if ADAPTER:
+if ADAPTER == "prefix":
     OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(PREFIX_LENGTH)
+elif ADAPTER in ["houlsby", "pfeiffer"]:
+    OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(REDUCTION_FACTOR)
+elif ADAPTER == 'union':
+    OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-r" + str(REDUCTION_FACTOR) + "-l" + str(PREFIX_LENGTH)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-GRADIENT_CHECKPOINTING = False if ADAPTER == 'prefix' else GRADIENT_CHECKPOINTING
+GRADIENT_CHECKPOINTING = False if ADAPTER in ['prefix', 'union'] else GRADIENT_CHECKPOINTING
 USE_WEIGHTED_LAYER_SUM = True if ADAPTER else False
 
 @dataclass
@@ -367,7 +372,6 @@ def main():
     logger.info("TRAIN_SPLIT_NAME = " + str(TRAIN_SPLIT_NAME))
     logger.info("EVAL_SPLIT_NAME = " + str(EVAL_SPLIT_NAME))
     logger.info("TEST_SPLIT_NAME = " + str(TEST_SPLIT_NAME))
-    logger.info("RESUME_TRAINING = " + str(RESUME_TRAINING))
     logger.info("EPOCHS = " + str(EPOCHS))
     logger.info("MAX_STEPS = " + str(MAX_STEPS))
     logger.info("PER_DEVICE_BATCH_SIZE = " + str(PER_DEVICE_BATCH_SIZE))
@@ -384,13 +388,13 @@ def main():
     logger.info("SET_SEED = " + str(SET_SEED))
     logger.info("FINAL_DROPOUT = " + str(FINAL_DROPOUT))
     logger.info("ADAPTER = " + str(ADAPTER))
-    logger.info("USE_WEIGHTED_LAYER_SUM = " + str(USE_WEIGHTED_LAYER_SUM))
 
-    if ADAPTER == "prefix":
+    if ADAPTER in ["prefix", "union"]:
         logger.info("PREFIX_LENGTH = " + str(PREFIX_LENGTH))
         logger.info("BOTTLENECK_SIZE = " + str(BOTTLENECK_SIZE))
         logger.info("PREFIX_DROPOUT = " + str(PREFIX_DROPOUT))
-    elif ADAPTER:
+
+    if ADAPTER in ["houlsby", "pfeiffer", "union"]:
         logger.info("LN_AFTER = " + str(LN_AFTER))
         logger.info("REDUCTION_FACTOR = " + str(REDUCTION_FACTOR))
         logger.info("NON_LINEARITY = " + str(NON_LINEARITY))
@@ -627,6 +631,7 @@ def main():
 
     total_params = sum(p.numel() for p in model.parameters())
 
+    # TODO: enhance this part of script
     if ADAPTER:
         if ADAPTER == 'prefix':
             adapter_config = PrefixTuningConfig(
@@ -648,6 +653,21 @@ def main():
                 non_linearity=NON_LINEARITY,
                 reduction_factor=REDUCTION_FACTOR,
             )
+        elif ADAPTER == "union":
+            adapter_config = ConfigUnion(
+                PrefixTuningConfig(
+                    flat=False,
+                    prefix_length=PREFIX_LENGTH,
+                    bottleneck_size=BOTTLENECK_SIZE,
+                    non_linearity="tanh",
+                    dropout=PREFIX_DROPOUT,
+                ),
+                HoulsbyConfig(
+                    ln_after=LN_AFTER,
+                    non_linearity=NON_LINEARITY,
+                    reduction_factor=REDUCTION_FACTOR,
+                ),
+            )
         else:
             raise ValueError("No corresponding adapter config.")
         model.add_adapter("asr-ctc", config=adapter_config, overwrite_ok=True)
@@ -664,32 +684,26 @@ def main():
     )
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    # head_params = sum(p.numel() for p in model.heads.parameters())
-    # adapter_params = trainable_params - head_params
-    # if isinstance(adapter_config, PrefixTuningConfig):
-        # prefix = model.base_model.prefix_tuning.prefix_tunings['ctc-adapter'].self_prefix
-        # adapter_params = prefix.config.prefix_length * prefix.n_layers * 2 * prefix.input_size
+    head_params = sum(p.numel() for p in model.heads.parameters())
 
     logger.info(f"Total parameters: {total_params}")
     logger.info(f"Trainable parameters: {trainable_params}")
-    # print("Adapter parameters: ", adapter_params)
-    # print("Head parameters: ", head_params)
+    logger.info(f"Head parameters: {head_params}")
     logger.info("Ratio of trainable parameters: {:.3f}%".format(trainable_params / total_params * 100))
 
-    if ADAPTER == "prefix":
+    if ADAPTER in ["prefix", "union"]:
         import copy
         pool = model.base_model.prefix_tuning.prefix_tunings['asr-ctc']
         pool_clone = copy.deepcopy(pool)
+        
+        mlp_param = sum(p.numel() for p in pool_clone.parameters() if p.requires_grad)
         pool_clone.eject()
-        prefix_params = sum(p.numel() for p in pool_clone.parameters() if p.requires_grad)
+        flat_param = sum(p.numel() for p in pool_clone.parameters() if p.requires_grad)
+        
+        diff = mlp_param - flat_param
         del pool_clone
         
-        # prefix = model.base_model.prefix_tuning.prefix_tunings['asr-ctc'].self_prefix
-        # prefix_params = prefix.config.prefix_length * prefix.n_layers * 2 * prefix.input_size
-        
-        head_params = sum(p.numel() for p in model.heads.parameters() if p.requires_grad)
-        
-        trainable_params = head_params + prefix_params
+        trainable_params = trainable_params - diff
         logger.info("[Prefix] Ratio of final added parameters: {:.3f}%".format(trainable_params / total_params * 100))
 
     processed_data_path = os.path.join("./dataset", DATASET + "-" + DATASET_CONFIG)
