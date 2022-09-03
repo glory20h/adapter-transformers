@@ -30,6 +30,8 @@ from transformers import (
     PrefixTuningConfig,
     PfeifferConfig,
     HoulsbyConfig,
+    ParallelConfig,
+    ConfigUnion,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
@@ -51,11 +53,11 @@ TEST_SPLIT_NAME = "test"
 RESUME_TRAINING = False
 EPOCHS = 150
 # -1 to disable
-MAX_STEPS = 20000
+MAX_STEPS = -1
 PER_DEVICE_BATCH_SIZE = 8
 GRADIENT_ACCUMULATION = 1
 PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
-LEARNING_RATE = 3e-5
+LEARNING_RATE = 1e-4
 # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"
 LR_SCHEDULER_TYPE = "linear"
 WARMUP_STEPS = 500
@@ -66,9 +68,8 @@ MAX_LENGTH_SECONDS = 20.0
 PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
 FINAL_DROPOUT = 0.1
-# 'prefix', 'houlsby', 'pfeiffer', None
+# 'prefix', 'houlsby', 'pfeiffer', 'parallel', 'union', None
 ADAPTER = None
-USE_WEIGHTED_LAYER_SUM = False
 # prefix tuning config
 PREFIX_LENGTH = 50
 BOTTLENECK_SIZE = 512
@@ -77,17 +78,22 @@ PREFIX_DROPOUT = 0.05
 REDUCTION_FACTOR = 4
 LN_AFTER = True
 NON_LINEARITY = "gelu"  # Pfeiffer default: "relu", Houlsby default: "swish"
+# layer weights
+USE_WEIGHTED_LAYER_SUM = False
 # ========================================== CONFIG ==========================================
 
 OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG
+
 if ADAPTER == "prefix":
     OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(PREFIX_LENGTH)
-elif ADAPTER in ["houlsby", "pfeiffer"]:
+elif ADAPTER in ["houlsby", "pfeiffer", "parallel"]:
     OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(REDUCTION_FACTOR)
+elif ADAPTER == 'union':
+    OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-r" + str(REDUCTION_FACTOR) + "-l" + str(PREFIX_LENGTH)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-GRADIENT_CHECKPOINTING = False if ADAPTER == 'prefix' else GRADIENT_CHECKPOINTING
+GRADIENT_CHECKPOINTING = False if ADAPTER in ['prefix', 'union'] else GRADIENT_CHECKPOINTING
 USE_WEIGHTED_LAYER_SUM = True if ADAPTER else USE_WEIGHTED_LAYER_SUM
 
 
@@ -234,10 +240,8 @@ def main():
         i += 1
         
     fileHandler = logging.FileHandler(logging_path)
-    # streamHandler = logging.StreamHandler(sys.stdout)
 
     logger.addHandler(fileHandler)
-    # logger.addHandler(streamHandler)
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -476,7 +480,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
 
     if ADAPTER:
-        if ADAPTER == 'prefix':
+        if ADAPTER == "prefix":
             adapter_config = PrefixTuningConfig(
                 flat=False,
                 prefix_length=PREFIX_LENGTH,
@@ -484,16 +488,38 @@ def main():
                 non_linearity="tanh",
                 dropout=PREFIX_DROPOUT,
             )
-        elif ADAPTER == 'houlsby':
+
+        elif ADAPTER == "houlsby":
             adapter_config = HoulsbyConfig(
                 ln_after=LN_AFTER,
                 non_linearity=NON_LINEARITY,
                 reduction_factor=REDUCTION_FACTOR,
             )
-        elif ADAPTER == 'pfeiffer':
+        elif ADAPTER == "pfeiffer":
             adapter_config = PfeifferConfig(
                 non_linearity=NON_LINEARITY,
                 reduction_factor=REDUCTION_FACTOR,
+            )
+        elif ADAPTER == "parallel":
+            adapter_config = ParallelConfig(
+                ln_after=LN_AFTER,
+                non_linearity=NON_LINEARITY,
+                reduction_factor=REDUCTION_FACTOR,
+            )
+        elif ADAPTER == "union":
+            adapter_config = ConfigUnion(
+                PrefixTuningConfig(
+                    flat=False,
+                    prefix_length=PREFIX_LENGTH,
+                    bottleneck_size=BOTTLENECK_SIZE,
+                    non_linearity="tanh",
+                    dropout=PREFIX_DROPOUT,
+                ),
+                HoulsbyConfig(
+                    ln_after=LN_AFTER,
+                    non_linearity=NON_LINEARITY,
+                    reduction_factor=REDUCTION_FACTOR,
+                ),
             )
         else:
             raise ValueError("No corresponding adapter config.")

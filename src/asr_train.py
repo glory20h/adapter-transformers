@@ -29,6 +29,7 @@ from transformers import (
     PrefixTuningConfig,
     PfeifferConfig,
     HoulsbyConfig,
+    ParallelConfig,
     ConfigUnion,
     set_seed,
 )
@@ -44,8 +45,8 @@ MODEL_NAME = "facebook/wav2vec2-xls-r-300m"
 # MODEL_NAME = "facebook/wav2vec2-large"
 # MODEL_NAME = "facebook/hubert-large-ll60k"
 # MODEL_NAME = "facebook/hubert-base-ls960"
-# DATASET = "common_voice"
-DATASET = "mozilla-foundation/common_voice_3_0"
+DATASET = "common_voice"
+# DATASET = "mozilla-foundation/common_voice_3_0"
 # DATASET = "superb"
 DATASET_CONFIG = "tr"
 # DATASET_CONFIG = "es"
@@ -55,9 +56,9 @@ EVAL_SPLIT_NAME = "validation"
 TEST_SPLIT_NAME = "test"
 FORCE_REDOWNLOAD = False
 RESUME_TRAINING = False
-EPOCHS = 150
+EPOCHS = 100
 # -1 to disable
-MAX_STEPS = 20000       
+MAX_STEPS = -1       
 PER_DEVICE_BATCH_SIZE = 2
 GRADIENT_ACCUMULATION = 8
 PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
@@ -72,23 +73,25 @@ MAX_DURATION_IN_SECONDS = 20.0
 PREPROCESSING_NUM_WORKERS = None
 SET_SEED = False
 FINAL_DROPOUT = 0.1
-# 'prefix', 'houlsby', 'pfeiffer', 'union', None
+# 'prefix', 'houlsby', 'pfeiffer', 'parallel', 'union', None
 ADAPTER = None
 # prefix tuning config
 PREFIX_LENGTH = 100
 BOTTLENECK_SIZE = 512
 PREFIX_DROPOUT = 0.05
 # adapter config
-LN_AFTER = False
 REDUCTION_FACTOR = 16
+LN_AFTER = False
 NON_LINEARITY = "swish"  # Pfeiffer default: "relu", Houlsby default: "swish"
+# layer weights
+USE_WEIGHTED_LAYER_SUM = False
 # ========================================== CONFIG ==========================================
 
 OUTPUT_DIR = "./results/" + MODEL_NAME.split("/")[-1] + "-" + DATASET + "-" + DATASET_CONFIG
 
 if ADAPTER == "prefix":
     OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(PREFIX_LENGTH)
-elif ADAPTER in ["houlsby", "pfeiffer"]:
+elif ADAPTER in ["houlsby", "pfeiffer", "parallel"]:
     OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-" + str(REDUCTION_FACTOR)
 elif ADAPTER == 'union':
     OUTPUT_DIR = OUTPUT_DIR + "-" + ADAPTER + "-r" + str(REDUCTION_FACTOR) + "-l" + str(PREFIX_LENGTH)
@@ -96,7 +99,7 @@ elif ADAPTER == 'union':
 os.makedirs(OUTPUT_DIR, exist_ok=True)
     
 GRADIENT_CHECKPOINTING = False if ADAPTER in ['prefix', 'union'] else GRADIENT_CHECKPOINTING
-USE_WEIGHTED_LAYER_SUM = True if ADAPTER else False
+USE_WEIGHTED_LAYER_SUM = True if ADAPTER else USE_WEIGHTED_LAYER_SUM
 
 @dataclass
 class ModelArguments:
@@ -354,10 +357,8 @@ def main():
         i += 1
         
     fileHandler = logging.FileHandler(logging_path)
-    # streamHandler = logging.StreamHandler(sys.stdout)
 
     logger.addHandler(fileHandler)
-    # logger.addHandler(streamHandler)
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -631,9 +632,8 @@ def main():
 
     total_params = sum(p.numel() for p in model.parameters())
 
-    # TODO: enhance this part of script
     if ADAPTER:
-        if ADAPTER == 'prefix':
+        if ADAPTER == "prefix":
             adapter_config = PrefixTuningConfig(
                 flat=False,
                 prefix_length=PREFIX_LENGTH,
@@ -642,14 +642,20 @@ def main():
                 dropout=PREFIX_DROPOUT,
             )
 
-        elif ADAPTER == 'houlsby':
+        elif ADAPTER == "houlsby":
             adapter_config = HoulsbyConfig(
                 ln_after=LN_AFTER,
                 non_linearity=NON_LINEARITY,
                 reduction_factor=REDUCTION_FACTOR,
             )
-        elif ADAPTER == 'pfeiffer':
+        elif ADAPTER == "pfeiffer":
             adapter_config = PfeifferConfig(
+                non_linearity=NON_LINEARITY,
+                reduction_factor=REDUCTION_FACTOR,
+            )
+        elif ADAPTER == "parallel":
+            adapter_config = ParallelConfig(
+                ln_after=LN_AFTER,
                 non_linearity=NON_LINEARITY,
                 reduction_factor=REDUCTION_FACTOR,
             )
