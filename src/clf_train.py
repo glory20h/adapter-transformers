@@ -66,6 +66,7 @@ EVAL_STEPS = 400
 GRADIENT_CHECKPOINTING = True
 MAX_LENGTH_SECONDS = 20.0
 PREPROCESSING_NUM_WORKERS = None
+DATALOADER_NUM_WORKERS = 8
 SET_SEED = False
 FINAL_DROPOUT = 0.1
 # 'prefix', 'houlsby', 'pfeiffer', 'parallel', 'union', None
@@ -76,8 +77,8 @@ BOTTLENECK_SIZE = 512
 PREFIX_DROPOUT = 0.05
 # adapter config
 REDUCTION_FACTOR = 4
-LN_AFTER = True
-NON_LINEARITY = "gelu"  # Pfeiffer default: "relu", Houlsby default: "swish"
+LN_AFTER = False
+NON_LINEARITY = "relu"  # pfeiffer, parallel default: "relu", houlsby default: "swish"
 # layer weights
 USE_WEIGHTED_LAYER_SUM = False
 # ========================================== CONFIG ==========================================
@@ -279,7 +280,7 @@ def main():
         logger.info("BOTTLENECK_SIZE = " + str(BOTTLENECK_SIZE))
         logger.info("PREFIX_DROPOUT = " + str(PREFIX_DROPOUT))
 
-    if ADAPTER in ["houlsby", "pfeiffer", "union"]:
+    if ADAPTER in ["houlsby", "pfeiffer", "parallel", "union"]:
         logger.info("LN_AFTER = " + str(LN_AFTER))
         logger.info("REDUCTION_FACTOR = " + str(REDUCTION_FACTOR))
         logger.info("NON_LINEARITY = " + str(NON_LINEARITY))
@@ -307,6 +308,7 @@ def main():
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         overwrite_output_dir=False if RESUME_TRAINING else True,
+        num_train_epochs=EPOCHS,
         max_steps=MAX_STEPS,
         per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
         per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
@@ -314,7 +316,7 @@ def main():
         learning_rate=LEARNING_RATE,
         lr_scheduler_type=LR_SCHEDULER_TYPE,
         warmup_steps=WARMUP_STEPS,
-        dataloader_num_workers=4,
+        dataloader_num_workers=DATALOADER_NUM_WORKERS,
         evaluation_strategy="steps",
         logging_steps=LOGGING_STEPS,
         eval_steps=EVAL_STEPS,
@@ -544,17 +546,19 @@ def main():
     logger.info(f"Trainable parameters: {trainable_params}")
     logger.info("Ratio of trainable parameters: {:.3f}%".format(trainable_params / total_params * 100))
 
-    if ADAPTER == "prefix":
+    if ADAPTER in ["prefix", "union"]:
         import copy
-        pool = model.base_model.prefix_tuning.prefix_tunings['asr-ctc']
+        pool = model.base_model.prefix_tuning.prefix_tunings[DATASET_CONFIG+"-clf"]
         pool_clone = copy.deepcopy(pool)
+        
+        mlp_param = sum(p.numel() for p in pool_clone.parameters() if p.requires_grad)
         pool_clone.eject()
-        prefix_params = sum(p.numel() for p in pool_clone.parameters() if p.requires_grad)
+        flat_param = sum(p.numel() for p in pool_clone.parameters() if p.requires_grad)
+        
+        diff = mlp_param - flat_param
         del pool_clone
-
-        head_params = sum(p.numel() for p in model.heads.parameters() if p.requires_grad)
-
-        trainable_params = head_params + prefix_params
+        
+        trainable_params = trainable_params - diff
         logger.info("[Prefix] Ratio of final added parameters: {:.3f}%".format(trainable_params / total_params * 100))
 
     metric = load_metric("accuracy")

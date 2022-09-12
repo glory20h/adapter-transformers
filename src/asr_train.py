@@ -71,6 +71,7 @@ EVAL_STEPS = 400
 GRADIENT_CHECKPOINTING = True
 MAX_DURATION_IN_SECONDS = 20.0
 PREPROCESSING_NUM_WORKERS = None
+DATALOADER_NUM_WORKERS = 8
 SET_SEED = False
 FINAL_DROPOUT = 0.1
 # 'prefix', 'houlsby', 'pfeiffer', 'parallel', 'union', None
@@ -82,7 +83,7 @@ PREFIX_DROPOUT = 0.05
 # adapter config
 REDUCTION_FACTOR = 16
 LN_AFTER = False
-NON_LINEARITY = "swish"  # Pfeiffer default: "relu", Houlsby default: "swish"
+NON_LINEARITY = "relu"  # pfeiffer, parallel default: "relu", houlsby default: "swish"
 # layer weights
 USE_WEIGHTED_LAYER_SUM = False
 # ========================================== CONFIG ==========================================
@@ -395,7 +396,7 @@ def main():
         logger.info("BOTTLENECK_SIZE = " + str(BOTTLENECK_SIZE))
         logger.info("PREFIX_DROPOUT = " + str(PREFIX_DROPOUT))
 
-    if ADAPTER in ["houlsby", "pfeiffer", "union"]:
+    if ADAPTER in ["houlsby", "pfeiffer", "parallel", "union"]:
         logger.info("LN_AFTER = " + str(LN_AFTER))
         logger.info("REDUCTION_FACTOR = " + str(REDUCTION_FACTOR))
         logger.info("NON_LINEARITY = " + str(NON_LINEARITY))
@@ -432,7 +433,7 @@ def main():
         learning_rate=LEARNING_RATE,
         lr_scheduler_type=LR_SCHEDULER_TYPE,
         warmup_steps=WARMUP_STEPS,
-        dataloader_num_workers=4,
+        dataloader_num_workers=DATALOADER_NUM_WORKERS,
         evaluation_strategy="steps",
         length_column_name="input_length",
         logging_steps=LOGGING_STEPS,
