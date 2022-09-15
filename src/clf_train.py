@@ -65,7 +65,7 @@ LOGGING_STEPS = 100
 EVAL_STEPS = 400
 GRADIENT_CHECKPOINTING = True
 MAX_LENGTH_SECONDS = 20.0
-PREPROCESSING_NUM_WORKERS = None
+PREPROCESSING_NUM_WORKERS = 8
 DATALOADER_NUM_WORKERS = 8
 SET_SEED = False
 FINAL_DROPOUT = 0.1
@@ -333,19 +333,11 @@ def main():
     if SET_SEED:
         set_seed(training_args.seed)
 
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-        model_args.model_name_or_path,
-        return_attention_mask=model_args.attention_mask,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=data_args.use_auth_token,
-    )
-
     # Prepare Data
     processed_data_path = os.path.join("./dataset", DATASET + "-" + DATASET_CONFIG)
 
     try:
-        vectorized_datasets = load_from_disk(processed_data_path)
+        training_datasets = load_from_disk(processed_data_path)
     except:
         raw_datasets = DatasetDict()
 
@@ -393,57 +385,41 @@ def main():
             use_auth_token=data_args.use_auth_token,
         )
         
-        vectorized_datasets = raw_datasets.cast_column(
-            data_args.audio_column_name, datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate)
+        training_datasets = raw_datasets.cast_column(
+            data_args.audio_column_name, datasets.features.Audio(sampling_rate=16000)
         )
-        
-        os.makedirs(processed_data_path, exist_ok=True)
-        vectorized_datasets.save_to_disk(processed_data_path)
 
-    labels = vectorized_datasets["train"].features[data_args.label_column_name].names
+        def prepare_dataset(batch):
+            batch["input_values"] = [sample["array"] for sample in batch[data_args.audio_column_name]]
+            batch["labels"] = batch[data_args.label_column_name]
+            return batch
+
+        training_datasets = training_datasets.map(
+            prepare_dataset,
+            batched=True,
+            batch_size=8,
+            remove_columns=next(iter(training_datasets.values())).column_names,
+            num_proc=data_args.preprocessing_num_workers,
+            desc="preprocess datasets",
+        )
+
+        os.makedirs(processed_data_path, exist_ok=True)
+        training_datasets.save_to_disk(processed_data_path)
+
+    labels = training_datasets["train"].features["labels"].names
 
     label2id, id2label = dict(), dict()
     for i, label in enumerate(labels):
         label2id[label] = str(i)
         id2label[str(i)] = label
 
-    def random_subsample(wav: np.ndarray, max_length: float, sample_rate: int = 16000):
-        """Randomly sample chunks of 'max_length' seconds from the input audio"""
-        sample_length = int(round(sample_rate * max_length))
-        if len(wav) <= sample_length:
-            return wav
-        random_offset = randint(0, len(wav) - sample_length - 1)
-        return wav[random_offset : random_offset + sample_length]
-
-    # Apply train_transforms across a batch.
-    def train_transforms(batch):
-        output_batch = {"input_values": []}
-        for audio in batch[data_args.audio_column_name]:
-            wav = random_subsample(
-                audio['array'], max_length=data_args.max_length_seconds, sample_rate=feature_extractor.sampling_rate
-            )
-            output_batch['input_values'].append(wav)
-        output_batch['labels'] = [label for label in batch[data_args.label_column_name]]
-                
-        return output_batch
-
-    def val_transforms(batch):
-        output_batch = {"input_values": []}
-        for audio in batch[data_args.audio_column_name]:
-            wav = audio['array']
-            output_batch['input_values'].append(wav)
-        output_batch['labels'] = [label for label in batch[data_args.label_column_name]]
-        
-        return output_batch
-
-    # Set transforms for train
-    vectorized_datasets["train"].set_transform(train_transforms, output_all_columns=False)
-
-    # Set transforms for validation
-    vectorized_datasets["eval"].set_transform(val_transforms, output_all_columns=False)
-
-    # Set transforms for test
-    vectorized_datasets["test"].set_transform(val_transforms, output_all_columns=False)
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+        model_args.model_name_or_path,
+        return_attention_mask=model_args.attention_mask,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=data_args.use_auth_token,
+    )
 
     config_cls = HubertConfig if 'hubert' in MODEL_NAME else Wav2Vec2Config
     config = config_cls.from_pretrained(
@@ -580,8 +556,8 @@ def main():
         data_collator=None,  # Use default data collator
         args=training_args,
         compute_metrics=compute_metrics,
-        train_dataset=vectorized_datasets["train"],
-        eval_dataset=vectorized_datasets["eval"],
+        train_dataset=training_datasets["train"],
+        eval_dataset=training_datasets["eval"],
         tokenizer=feature_extractor,
         callbacks=[LogCallback],
     )
@@ -612,7 +588,7 @@ def main():
     trainer.log_metrics("eval", eval_results)
     trainer.save_metrics("eval", eval_results)
 
-    test_results = trainer.evaluate(vectorized_datasets["test"])
+    test_results = trainer.evaluate(training_datasets["test"])
     trainer.log_metrics("eval", test_results)
     trainer.save_metrics("eval", test_results)
 

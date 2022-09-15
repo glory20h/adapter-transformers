@@ -64,7 +64,7 @@ GRADIENT_ACCUMULATION = 8
 PER_DEVICE_EVAL_BATCH_SIZE = PER_DEVICE_BATCH_SIZE
 LEARNING_RATE = 1e-4
 # "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"
-LR_SCHEDULER_TYPE = "linear"
+LR_SCHEDULER_TYPE = "constant_with_warmup"
 WARMUP_STEPS = 500
 LOGGING_STEPS = 100
 EVAL_STEPS = 400
@@ -348,7 +348,6 @@ class DataCollatorCTCWithPadding:
 
 
 def main():
-
     # Setup logging
     logging_path = os.path.join(OUTPUT_DIR, 'train.log')
     i = 2
@@ -451,126 +450,122 @@ def main():
     if SET_SEED:
         set_seed(training_args.seed)
 
-    # Prepare Data
-    raw_datasets = DatasetDict()
-
-    raw_datasets["train"] = load_dataset(
-        data_args.dataset_name,
-        data_args.dataset_config_name,
-        split=data_args.train_split_name,
-        use_auth_token=data_args.use_auth_token,
-        download_mode="force_redownload" if FORCE_REDOWNLOAD else None,
-    )
-
-    if data_args.audio_column_name not in raw_datasets["train"].column_names:
-        raise ValueError(
-            f"--audio_column_name '{data_args.audio_column_name}' not found in dataset '{data_args.dataset_name}'. "
-            "Make sure to set `--audio_column_name` to the correct audio column - one of "
-            f"{', '.join(raw_datasets['train'].column_names)}."
-        )
-
-    if data_args.text_column_name not in raw_datasets["train"].column_names:
-        raise ValueError(
-            f"--text_column_name {data_args.text_column_name} not found in dataset '{data_args.dataset_name}'. "
-            "Make sure to set `--text_column_name` to the correct text column - one of "
-            f"{', '.join(raw_datasets['train'].column_names)}."
-        )
-
-    if data_args.max_train_samples is not None:
-        raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
-                                                                
-    raw_datasets["eval"] = load_dataset(
-        data_args.dataset_name,
-        data_args.dataset_config_name,
-        split=data_args.eval_split_name,
-        use_auth_token=data_args.use_auth_token,
-    )
-
-    if data_args.max_eval_samples is not None:
-        raw_datasets["eval"] = raw_datasets["eval"].select(range(data_args.max_eval_samples))
-        
-    raw_datasets["test"] = load_dataset(
-        data_args.dataset_name,
-        data_args.dataset_config_name,
-        split=data_args.test_split_name,
-        use_auth_token=data_args.use_auth_token,
-    )
-
-    chars_to_ignore_regex = (
-        f'[{"".join(data_args.chars_to_ignore)}]' if data_args.chars_to_ignore is not None else None
-    )
-    text_column_name = data_args.text_column_name
-
-    def remove_special_characters(batch):
-        if chars_to_ignore_regex is not None:
-            batch["target_text"] = re.sub(chars_to_ignore_regex, "", batch[text_column_name]).lower() + " "
-        else:
-            batch["target_text"] = batch[text_column_name].lower() + " "
-        return batch
-
-    with training_args.main_process_first(desc="dataset map special characters removal"):
-        raw_datasets = raw_datasets.map(
-            remove_special_characters,
-            remove_columns=[text_column_name],
-            desc="remove special characters from datasets",
-        )
-
-    config_cls = HubertConfig if 'hubert' in MODEL_NAME else Wav2Vec2Config
-    config = config_cls.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_auth_token=data_args.use_auth_token,
-    )
-
-    def create_vocabulary_from_data(
-        datasets: DatasetDict,
-        word_delimiter_token: Optional[str] = None,
-        unk_token: Optional[str] = None,
-        pad_token: Optional[str] = None,
-    ):
-        # Given training and test labels create vocabulary
-        def extract_all_chars(batch):
-            all_text = " ".join(batch["target_text"])
-            vocab = list(set(all_text))
-            return {"vocab": [vocab], "all_text": [all_text]}
-        
-        vocabs = datasets.map(
-            extract_all_chars,
-            batched=True,
-            batch_size=-1,
-            keep_in_memory=True,
-            remove_columns=datasets["train"].column_names,
-        )
-        
-        vocab_set = set()
-        for i, dataset in enumerate(vocabs.values()):
-            vocab_set = vocab_set | set(dataset['vocab'][0])
-        
-        vocab_dict = {v: k for k, v in enumerate(sorted(list(vocab_set)))}
-        
-        # replace white space with delimiter token
-        if word_delimiter_token is not None:
-            vocab_dict[word_delimiter_token] = vocab_dict[" "]
-            del vocab_dict[" "]
-            
-        # add unk and pad token
-        if unk_token is not None:
-            vocab_dict[unk_token] = len(vocab_dict)
-        
-        if pad_token is not None:
-            vocab_dict[pad_token] = len(vocab_dict)
-            
-        return vocab_dict
+    processed_data_path = os.path.join("./dataset", DATASET + "-" + DATASET_CONFIG)
+    data_name = DATASET.split('/')[-1] if 'mozilla' in DATASET else DATASET
+    vocab_file = os.path.join('./vocab', "vocab-" + data_name + "-" + DATASET_CONFIG + ".json")
 
     word_delimiter_token = data_args.word_delimiter_token
     unk_token = data_args.unk_token
     pad_token = data_args.pad_token
 
-    data_name = DATASET.split('/')[-1] if 'mozilla' in DATASET else DATASET
+    try:
+        training_datasets = load_from_disk(processed_data_path)
+    except:
+        ## Download Data
+        raw_datasets = DatasetDict()
 
-    vocab_file = os.path.join('./vocab', "vocab-" + data_name + "-" + DATASET_CONFIG + ".json")
+        raw_datasets["train"] = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            split=data_args.train_split_name,
+            use_auth_token=data_args.use_auth_token,
+            download_mode="force_redownload" if FORCE_REDOWNLOAD else None,
+        )
 
-    with training_args.main_process_first(desc="dataset map vocabulary creation"):
+        if data_args.audio_column_name not in raw_datasets["train"].column_names:
+            raise ValueError(
+                f"--audio_column_name '{data_args.audio_column_name}' not found in dataset '{data_args.dataset_name}'. "
+                "Make sure to set `--audio_column_name` to the correct audio column - one of "
+                f"{', '.join(raw_datasets['train'].column_names)}."
+            )
+
+        if data_args.text_column_name not in raw_datasets["train"].column_names:
+            raise ValueError(
+                f"--text_column_name {data_args.text_column_name} not found in dataset '{data_args.dataset_name}'. "
+                "Make sure to set `--text_column_name` to the correct text column - one of "
+                f"{', '.join(raw_datasets['train'].column_names)}."
+            )
+
+        if data_args.max_train_samples is not None:
+            raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
+                                                                    
+        raw_datasets["eval"] = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            split=data_args.eval_split_name,
+            use_auth_token=data_args.use_auth_token,
+        )
+
+        if data_args.max_eval_samples is not None:
+            raw_datasets["eval"] = raw_datasets["eval"].select(range(data_args.max_eval_samples))
+            
+        raw_datasets["test"] = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            split=data_args.test_split_name,
+            use_auth_token=data_args.use_auth_token,
+        )
+        
+        ## Create vocab from dataset
+        chars_to_ignore_regex = (
+            f'[{"".join(data_args.chars_to_ignore)}]' if data_args.chars_to_ignore is not None else None
+        )
+        text_column_name = data_args.text_column_name
+
+        def remove_special_characters(batch):
+            if chars_to_ignore_regex is not None:
+                batch["target_text"] = re.sub(chars_to_ignore_regex, "", batch[text_column_name]).lower() + " "
+            else:
+                batch["target_text"] = batch[text_column_name].lower() + " "
+            return batch
+
+        with training_args.main_process_first(desc="dataset map special characters removal"):
+            raw_datasets = raw_datasets.map(
+                remove_special_characters,
+                remove_columns=[text_column_name],
+                desc="remove special characters from datasets",
+            )
+
+        def create_vocabulary_from_data(
+            datasets: DatasetDict,
+            word_delimiter_token: Optional[str] = None,
+            unk_token: Optional[str] = None,
+            pad_token: Optional[str] = None,
+        ):
+            # Given training and test labels create vocabulary
+            def extract_all_chars(batch):
+                all_text = " ".join(batch["target_text"])
+                vocab = list(set(all_text))
+                return {"vocab": [vocab], "all_text": [all_text]}
+            
+            vocabs = datasets.map(
+                extract_all_chars,
+                batched=True,
+                batch_size=-1,
+                keep_in_memory=True,
+                remove_columns=datasets["train"].column_names,
+            )
+            
+            vocab_set = set()
+            for i, dataset in enumerate(vocabs.values()):
+                vocab_set = vocab_set | set(dataset['vocab'][0])
+            
+            vocab_dict = {v: k for k, v in enumerate(sorted(list(vocab_set)))}
+            
+            # replace white space with delimiter token
+            if word_delimiter_token is not None:
+                vocab_dict[word_delimiter_token] = vocab_dict[" "]
+                del vocab_dict[" "]
+                
+            # add unk and pad token
+            if unk_token is not None:
+                vocab_dict[unk_token] = len(vocab_dict)
+            
+            if pad_token is not None:
+                vocab_dict[pad_token] = len(vocab_dict)
+                
+            return vocab_dict
+
         if not os.path.isfile(vocab_file):
             os.makedirs('vocab', exist_ok=True)
             vocab_dict = create_vocabulary_from_data(
@@ -583,25 +578,103 @@ def main():
             with open(vocab_file, "w") as file:
                 json.dump(vocab_dict, file)
 
-    tokenizer = Wav2Vec2CTCTokenizer(
-        vocab_file=vocab_file,
-        unk_token=unk_token,
-        pad_token=pad_token,
-        word_delimiter_token=word_delimiter_token,
-    )
+        ## Process dataset
+        audio_column_name = data_args.audio_column_name
+        num_workers = data_args.preprocessing_num_workers
+        phoneme_language = data_args.phoneme_language
+        dataset_sampling_rate = next(iter(raw_datasets.values())).features[data_args.audio_column_name].sampling_rate
 
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_auth_token=data_args.use_auth_token
-    )
+        if dataset_sampling_rate != 16000:
+            # datasets can take care of automatically loading and resampling the audio
+            raw_datasets = raw_datasets.cast_column(
+                audio_column_name, datasets.features.Audio(sampling_rate=16000)
+            )
 
-    processor = Wav2Vec2Processor(
-        feature_extractor=feature_extractor,
-        tokenizer=tokenizer,
-    )
+        tokenizer = Wav2Vec2CTCTokenizer(
+            vocab_file=vocab_file,
+            unk_token=unk_token,
+            pad_token=pad_token,
+            word_delimiter_token=word_delimiter_token,
+        )
+
+        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=data_args.use_auth_token
+        )
+
+        processor = Wav2Vec2Processor(
+            feature_extractor=feature_extractor,
+            tokenizer=tokenizer,
+        )
+
+        def prepare_dataset(batch):
+            # load audio
+            sample = batch[audio_column_name]
+
+            inputs = processor(sample["array"], sampling_rate=sample["sampling_rate"])
+            batch["input_values"] = inputs.input_values[0]
+            batch["input_length"] = len(batch["input_values"])
+
+            # encode targets
+            additional_kwargs = {}
+            if phoneme_language is not None:
+                additional_kwargs["phonemizer_lang"] = phoneme_language
+
+            with processor.as_target_processor():
+                batch["labels"] = processor(batch["target_text"], **additional_kwargs).input_ids
+            return batch
+
+        training_datasets = raw_datasets.map(
+            prepare_dataset,
+            remove_columns=next(iter(raw_datasets.values())).column_names,
+            num_proc=num_workers,
+            desc="preprocess datasets",
+        )
+        
+        os.makedirs(processed_data_path, exist_ok=True)
+        training_datasets.save_to_disk(processed_data_path)
+    else:
+        tokenizer = Wav2Vec2CTCTokenizer(
+            vocab_file=vocab_file,
+            unk_token=unk_token,
+            pad_token=pad_token,
+            word_delimiter_token=word_delimiter_token,
+        )
+
+        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=data_args.use_auth_token
+        )
+
+        processor = Wav2Vec2Processor(
+            feature_extractor=feature_extractor,
+            tokenizer=tokenizer,
+        )
 
     data_collator = DataCollatorCTCWithPadding(processor=processor)
+
+    ## Filter out dataset
+    max_input_length = data_args.max_duration_in_seconds * feature_extractor.sampling_rate
+    min_input_length = data_args.min_duration_in_seconds * feature_extractor.sampling_rate    
+        
+    def is_audio_in_length_range(length):
+        return length > min_input_length and length < max_input_length
+
+    training_datasets = training_datasets.filter(
+        is_audio_in_length_range,
+        input_columns=["input_length"]
+    )
+    training_datasets = training_datasets.remove_columns("input_length")
+
+    ## Prepare Model
+    config_cls = HubertConfig if 'hubert' in MODEL_NAME else Wav2Vec2Config
+    config = config_cls.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_auth_token=data_args.use_auth_token,
+    )
 
     config.update(
         {
@@ -713,62 +786,7 @@ def main():
         trainable_params = trainable_params - diff
         logger.info("[Prefix] Ratio of final added parameters: {:.3f}%".format(trainable_params / total_params * 100))
 
-    processed_data_path = os.path.join("./dataset", DATASET + "-" + DATASET_CONFIG)
-
-    audio_column_name = data_args.audio_column_name
-    num_workers = data_args.preprocessing_num_workers
-    phoneme_language = data_args.phoneme_language
-    max_input_length = data_args.max_duration_in_seconds * feature_extractor.sampling_rate
-    min_input_length = data_args.min_duration_in_seconds * feature_extractor.sampling_rate
-
-    try:
-        vectorized_datasets = load_from_disk(processed_data_path)
-    except:
-        dataset_sampling_rate = next(iter(raw_datasets.values())).features[data_args.audio_column_name].sampling_rate
-
-        if dataset_sampling_rate != feature_extractor.sampling_rate:
-            # datasets can take care of automatically loading and resampling the audio
-            raw_datasets = raw_datasets.cast_column(
-                audio_column_name, datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate)
-            )
-
-        def prepare_dataset(batch):
-            # load audio
-            sample = batch[audio_column_name]
-
-            inputs = processor(sample["array"], sampling_rate=sample["sampling_rate"])
-            batch["input_values"] = inputs.input_values[0]
-            batch["input_length"] = len(batch["input_values"])
-
-            # encode targets
-            additional_kwargs = {}
-            if phoneme_language is not None:
-                additional_kwargs["phonemizer_lang"] = phoneme_language
-
-            with processor.as_target_processor():
-                batch["labels"] = processor(batch["target_text"], **additional_kwargs).input_ids
-            return batch
-
-        vectorized_datasets = raw_datasets.map(
-            prepare_dataset,
-            remove_columns=next(iter(raw_datasets.values())).column_names,
-            num_proc=num_workers,
-            desc="preprocess datasets",
-        )
-        
-        os.makedirs(processed_data_path, exist_ok=True)
-        vectorized_datasets.save_to_disk(processed_data_path)
-        
-    def is_audio_in_length_range(length):
-        return length > min_input_length and length < max_input_length
-
-    vectorized_datasets = vectorized_datasets.filter(
-        is_audio_in_length_range,
-        num_proc=num_workers,
-        input_columns=["input_length"]
-    )
-    vectorized_datasets = vectorized_datasets.remove_columns("input_length")
-
+    ## Prepare Metrics
     eval_metrics = {metric: load_metric(metric) for metric in data_args.eval_metrics}
 
     def compute_metrics(pred):
@@ -796,8 +814,8 @@ def main():
         data_collator=data_collator,
         args=training_args,
         compute_metrics=compute_metrics,
-        train_dataset=vectorized_datasets["train"],
-        eval_dataset=vectorized_datasets["eval"],
+        train_dataset=training_datasets["train"],
+        eval_dataset=training_datasets["eval"],
         tokenizer=feature_extractor,
         callbacks=[LogCallback],
     )
@@ -828,7 +846,7 @@ def main():
     trainer.log_metrics("eval", eval_results)
     trainer.save_metrics("eval", eval_results)
 
-    test_results = trainer.evaluate(vectorized_datasets["test"])
+    test_results = trainer.evaluate(training_datasets["test"])
     trainer.log_metrics("eval", test_results)
     trainer.save_metrics("eval", test_results)
 
